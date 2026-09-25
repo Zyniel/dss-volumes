@@ -1,0 +1,97 @@
+-- dbmon PostgreSQL adapter, fact "objects": one row per object and tablespace.
+-- Objects are the relations with storage: tables, materialized views, indexes, TOAST
+-- tables and their indexes (the LOB family: out-of-line values), sequences.
+-- Partitions are summed under the root of their partition tree, as Oracle sums
+-- partitions under their table. TOAST storage is attributed to the schema of its table.
+-- Size = all forks (main, free space map, visibility map, init).
+-- ts_kind: DEFAULT (database default tablespace) or OTHER; PostgreSQL has no quotas.
+-- Rendered by dbmon/adapters/postgres, not runnable as-is. Placeholders:
+--   scope_filter     schemas in scope (default: every non-system schema)
+--   table_filter     keeps the objects of one table
+WITH
+scope AS (
+  SELECT n.oid, n.nspname
+  FROM   pg_namespace n
+  WHERE  {{scope_filter}}
+),
+db AS (
+  SELECT d.dattablespace AS default_ts
+  FROM   pg_database d
+  WHERE  d.datname = current_database()
+),
+-- tables, partitions and materialized views in scope, with the root of each partition tree
+tbl AS (
+  SELECT c.oid, c.relname, c.relkind, c.relispartition, c.reltablespace, c.reltoastrelid,
+         s.nspname,
+         CASE WHEN c.relispartition THEN pg_partition_root(c.oid::regclass)::oid ELSE c.oid END AS root_oid
+  FROM   pg_class c
+         JOIN scope s ON s.oid = c.relnamespace
+  WHERE  c.relkind IN ('r', 'p', 'm')
+),
+-- every relation with storage, attributed to its table
+rel AS (
+  -- table data
+  SELECT t.oid, t.nspname AS schema_name, r.relname AS object_name,
+         CASE WHEN t.relkind = 'm' THEN 'MATERIALIZED VIEW' ELSE 'TABLE' END AS object_type,
+         'TABLE' AS family, t.relispartition AS is_partition, t.reltablespace,
+         r.nspname AS parent_schema, r.relname AS parent_table
+  FROM   tbl t
+         JOIN tbl r ON r.oid = t.root_oid
+  WHERE  t.relkind IN ('r', 'm')
+  UNION ALL
+  -- indexes: partition indexes under the root of their index tree
+  SELECT i.oid, t.nspname, ri.relname, 'INDEX', 'INDEX', i.relispartition, i.reltablespace,
+         r.nspname, r.relname
+  FROM   pg_index x
+         JOIN pg_class i  ON i.oid = x.indexrelid
+         JOIN tbl t       ON t.oid = x.indrelid
+         JOIN tbl r       ON r.oid = t.root_oid
+         JOIN pg_class ri ON ri.oid = CASE WHEN i.relispartition
+                                           THEN pg_partition_root(i.oid::regclass)::oid
+                                           ELSE i.oid END
+  WHERE  i.relkind = 'i'
+  UNION ALL
+  -- TOAST tables
+  SELECT tt.oid, t.nspname, tt.relname, 'TOAST TABLE', 'LOB', false, tt.reltablespace,
+         r.nspname, r.relname
+  FROM   tbl t
+         JOIN pg_class tt ON tt.oid = t.reltoastrelid
+         JOIN tbl r       ON r.oid = t.root_oid
+  UNION ALL
+  -- TOAST indexes
+  SELECT ti.oid, t.nspname, ti.relname, 'TOAST INDEX', 'LOBINDEX', false, ti.reltablespace,
+         r.nspname, r.relname
+  FROM   tbl t
+         JOIN pg_index x  ON x.indrelid = t.reltoastrelid
+         JOIN pg_class ti ON ti.oid = x.indexrelid
+         JOIN tbl r       ON r.oid = t.root_oid
+  UNION ALL
+  -- sequences: storage of their own, no table
+  SELECT c.oid, s.nspname, c.relname, 'SEQUENCE', 'OTHER', false, c.reltablespace,
+         CAST(NULL AS name), CAST(NULL AS name)
+  FROM   pg_class c
+         JOIN scope s ON s.oid = c.relnamespace
+  WHERE  c.relkind = 'S'
+)
+SELECT o.schema_name,
+       o.object_name,
+       o.object_type,
+       o.family,
+       o.parent_schema,
+       o.parent_table,
+       ts.spcname                                                        AS tablespace_name,
+       CASE WHEN ts.oid = db.default_ts THEN 'DEFAULT' ELSE 'OTHER' END  AS ts_kind,
+       CASE WHEN bool_or(o.is_partition) THEN 'YES' ELSE 'NO' END        AS partitioned,
+       COUNT(*)                                                          AS n_segments,
+       ROUND(SUM(pg_relation_size(o.oid, 'main') + pg_relation_size(o.oid, 'fsm')
+                 + pg_relation_size(o.oid, 'vm') + pg_relation_size(o.oid, 'init'))
+             / 1048576.0, 3)                                             AS size_mb,
+       CAST(NULL AS text)                                                AS compression
+FROM   rel o
+       CROSS JOIN db
+       JOIN pg_tablespace ts ON ts.oid = CASE WHEN o.reltablespace = 0 THEN db.default_ts
+                                             ELSE o.reltablespace END
+{{table_filter}}
+GROUP  BY o.schema_name, o.object_name, o.object_type, o.family, o.parent_schema, o.parent_table,
+          ts.spcname, ts.oid, db.default_ts
+ORDER  BY o.schema_name, size_mb DESC

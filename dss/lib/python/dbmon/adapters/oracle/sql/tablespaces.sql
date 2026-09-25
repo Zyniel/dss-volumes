@@ -1,16 +1,16 @@
--- dbmon template "tablespaces": one row per tablespace of the database.
+-- dbmon Oracle adapter, fact "tablespaces": one row per tablespace of the database.
 -- Derived from 01_tablespace_usage.sql (repository root), without the use-case
 -- checks: capacity, occupation, recycle bin, usage metrics and ASM storage.
 -- Identity columns are added by the engine.
--- Rendered by dbmon/queries.py, not runnable as-is. Placeholders:
+-- Rendered by dbmon/adapters/oracle, not runnable as-is. Placeholders:
 --   ts_filter        tablespaces returned (default: all)
 --   seg_filter       same restriction on the segment scan
 --
 -- Space model (PERMANENT / UNDO)
---   alloc_mb       current size of the datafiles
+--   allocated_mb       current size of the datafiles
 --   max_mb         declared ceiling: autoextend MAXSIZE, or current size without autoextend
---   live_mb        segments that are not in the recycle bin
---   recyclebin_mb  segments in the recycle bin: reported free by Oracle and reused before
+--   used_mb        segments that are not in the recycle bin
+--   reclaimable_mb  segments in the recycle bin: reported free by Oracle and reused before
 --                  autoextending a datafile, but still holding blocks
 --   free_mb        alloc - live - recyclebin (also contains file header and bitmap blocks)
 --   tum_*          DBA_TABLESPACE_USAGE_METRICS, the view behind OEM space alerts:
@@ -125,17 +125,17 @@ SELECT t.tablespace_name,
        -- datafiles / tempfiles
        f.n_files,
        f.autoextensible,
-       ROUND(f.alloc_bytes / 1048576, 3)                                          AS alloc_mb,
+       ROUND(f.alloc_bytes / 1048576, 3)                                          AS allocated_mb,
        ROUND(f.max_bytes   / 1048576, 3)                                          AS max_mb,
        -- occupation
        CASE WHEN t.contents <> 'TEMPORARY'
-            THEN ROUND(NVL(sa.live_bytes, 0) / 1048576, 3) END                    AS live_mb,
+            THEN ROUND(NVL(sa.live_bytes, 0) / 1048576, 3) END                    AS used_mb,
        CASE WHEN t.contents <> 'TEMPORARY'
             THEN NVL(sa.live_segments, 0) END                                     AS live_segments,
        CASE WHEN t.contents <> 'TEMPORARY'
             THEN NVL(sa.live_owners, 0) END                                       AS live_owners,
        CASE WHEN t.contents <> 'TEMPORARY'
-            THEN ROUND(NVL(sa.rb_bytes, 0) / 1048576, 3) END                      AS recyclebin_mb,
+            THEN ROUND(NVL(sa.rb_bytes, 0) / 1048576, 3) END                      AS reclaimable_mb,
        CASE WHEN t.contents <> 'TEMPORARY'
             THEN NVL(sa.rb_segments, 0) END                                       AS recyclebin_segments,
        r.rb_tables                                                                AS recyclebin_tables,

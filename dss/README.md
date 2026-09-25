@@ -32,10 +32,10 @@ dss/
 | Function | One row per | Filters |
 |---|---|---|
 | `tablespaces(connections, names)` | tablespace | tablespace names |
-| `schemas(connections, owners, owner_rx)` | schema and tablespace it is tied to (default, quota, recycle bin) | scope |
-| `objects(connections, owners, owner_rx, table)` | object and tablespace, partitions summed | scope, table |
-| `tables(connections, owners, owner_rx, table)` | table, with indexes, LOBs and partitions rolled up | scope, table |
-| `lifecycle(connections, owners, owner_rx, table)` | table: creation, last DDL, statistics age, DML | scope, table |
+| `schemas(connections, owners)` | schema and tablespace it is tied to (default, quota, recycle bin) | owners |
+| `objects(connections, owners, table)` | object and tablespace, partitions summed | owners, table |
+| `tables(connections, owners, table)` | table, with indexes, LOBs and partitions rolled up | owners, table |
+| `lifecycle(connections, owners, table)` | table: creation, last DDL, statistics age, DML | owners, table |
 | `write(outputs, connections, ...)` | recipes: one dataset per query | each query takes the filters it accepts |
 | `uid(*parts)` | the key function, for your own entities | none |
 
@@ -45,7 +45,7 @@ dss/
   - a DataFrame with a `connection` column.
 
   Extra keys or columns, such as `env`, become label columns on every row. Reading, filtering and labelling the list is the caller's job.
-- **Scope:** `owners` takes exact schema names; `owner_rx` takes an Oracle regular expression. Use either, or both. Without them, the scope is every schema that isn't Oracle-maintained.
+- **`owners`:** exact schema names, chosen by the caller in whatever way suits them. Without it, the scope is every schema that isn't Oracle-maintained.
 - **`table`:** one table, by exact name. Without a single owner, each database first gets one small `DBA_TABLES` lookup, and only the schemas holding the table are read. Databases without it are logged as `NO_MATCH`.
 - **`with_log=True`:** the read functions also return the run log.
 - **Validation:** Dataiku's SQL executor has no bind variables, so every value is validated and quoted. `IN` lists are split every 1000 names (`ORA-01795`).
@@ -82,10 +82,14 @@ Every row carries `db_uid` plus a key per entity it describes. A key is a hash o
 import dbmon
 from dbmon import uc
 
-objs = dbmon.objects(conns, owners=uc.owners("SALES"))    # one UC
-objs = dbmon.objects(conns, owner_rx=uc.OWNER_RX)         # every UC
-objs = uc.enrich(objs)                                    # uc, schema_layer, ts_role, placement
-tabs = uc.enrich(dbmon.tables(conns, owner_rx=uc.OWNER_RX))
+owners = uc.owners("SALES")                               # one UC
+
+# every UC: list the schemas once, keep those that read as a UC
+s = uc.enrich(dbmon.schemas(conns))
+owners = sorted(s.loc[s["uc"].notna(), "owner"].unique())
+
+objs = uc.enrich(dbmon.objects(conns, owners=owners))     # uc, schema_layer, ts_role, placement
+tabs = uc.enrich(dbmon.tables(conns, owners=owners))
 tabs = tabs.merge(uc.table_placement(objs), on="table_uid", how="left")
 ```
 

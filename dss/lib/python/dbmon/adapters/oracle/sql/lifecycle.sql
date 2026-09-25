@@ -1,24 +1,21 @@
--- dbmon template "lifecycle".
--- Derived from 03b_table_lifecycle.sql (repository root): no naming convention, the scope is
--- chosen by the caller, identity columns are added by the engine.
--- Rendered by dbmon/queries.py, not runnable as-is. Placeholders:
---   owner_filter     schemas in scope (default: non Oracle-maintained)
+-- dbmon Oracle adapter, fact "lifecycle": creation, last DDL and changes since the last
+-- statistics, per table. Derived from 03b_table_lifecycle.sql (repository root): each
+-- dictionary view is read once and materialised before the hash joins, and
+-- DBA_TAB_STATISTICS is not used (row-by-row STALE_STATS, and a second row per table
+-- with Exadata real-time statistics). dml_pct_since_stats and stale_est are computed by
+-- the core, the same way for every engine.
+-- Rendered by dbmon/adapters/oracle, not runnable as-is. Placeholders:
+--   scope_filter     schemas in scope (default: non Oracle-maintained)
 --   table_filter     keeps one table in DBA_TABLES
 --   object_filter    same, in DBA_OBJECTS
 --   mods_filter      same, in DBA_TAB_MODIFICATIONS
 WITH
-params AS (
-  SELECT 10 AS stale_pct                                        -- default STALE_PERCENT
-  FROM   dual
-),
--- schemas in scope
 scope AS (
   SELECT /*+ MATERIALIZE */
          u.username
   FROM   dba_users u
-  WHERE  {{owner_filter}}
+  WHERE  {{scope_filter}}
 ),
--- same table list as 03 (IOT overflow / mapping and nested storage excluded)
 tabs AS (
   SELECT /*+ MATERIALIZE */
          t.owner, t.table_name, t.num_rows, t.last_analyzed
@@ -38,6 +35,7 @@ objs AS (
   AND    o.subobject_name IS NULL
   {{object_filter}}
 ),
+-- DML since the last statistics gathering, flushed from memory periodically
 mods AS (
   SELECT /*+ MATERIALIZE */
          m.table_owner, m.table_name, m.inserts, m.updates, m.deletes, m.truncated,
@@ -49,29 +47,20 @@ mods AS (
   {{mods_filter}}
 )
 SELECT /*+ USE_HASH(o m) */
-       t.owner,
+       t.owner                                                     AS schema_name,
        t.table_name,
        o.created,
        o.last_ddl_time,
+       t.num_rows                                                  AS row_estimate,
        t.last_analyzed,
-       t.num_rows,
+       NVL(m.inserts, 0) + NVL(m.updates, 0) + NVL(m.deletes, 0)   AS dml_since_stats,
+       NVL(m.truncated, 'NO')                                      AS truncated_since_stats,
+       -- engine details
        m.inserts                                                   AS dml_inserts,
        m.updates                                                   AS dml_updates,
        m.deletes                                                   AS dml_deletes,
-       m.truncated                                                 AS dml_truncated,
-       m.last_dml_ts,
-       ROUND(100 * (NVL(m.inserts, 0) + NVL(m.updates, 0) + NVL(m.deletes, 0))
-             / NULLIF(t.num_rows, 0), 2)                           AS dml_pct_since_stats,
-       CASE
-         WHEN t.last_analyzed IS NULL THEN NULL
-         WHEN m.truncated = 'YES'     THEN 'YES'
-         WHEN NVL(m.inserts, 0) + NVL(m.updates, 0) + NVL(m.deletes, 0)
-              > NVL(t.num_rows, 0) * p.stale_pct / 100
-                                      THEN 'YES'
-         ELSE 'NO'
-       END                                                         AS stale_est
+       m.last_dml_ts
 FROM   tabs t
-       CROSS JOIN params p
        LEFT JOIN objs o ON  o.owner       = t.owner
                         AND o.object_name = t.table_name
        LEFT JOIN mods m ON  m.table_owner = t.owner

@@ -1,15 +1,15 @@
--- dbmon template "objects".
+-- dbmon Oracle adapter, fact "objects".
 -- Derived from 02_object_usage.sql (repository root): no naming convention, the scope is
 -- chosen by the caller, identity columns are added by the engine.
--- Rendered by dbmon/queries.py, not runnable as-is. Placeholders:
---   owner_filter     schemas in scope (default: non Oracle-maintained)
+-- Rendered by dbmon/adapters/oracle, not runnable as-is. Placeholders:
+--   scope_filter     schemas in scope (default: non Oracle-maintained)
 --   table_filter     keeps the objects of one table
 WITH
 -- schemas in scope, with their default tablespace
 scope AS (
   SELECT u.username, u.default_tablespace
   FROM   dba_users u
-  WHERE  {{owner_filter}}
+  WHERE  {{scope_filter}}
 ),
 -- tablespaces where each schema holds a quota, besides its default one
 quotas AS (
@@ -156,13 +156,13 @@ obj AS (
             c.parent_owner, c.parent_table, c.tablespace_name, c.ts_kind
 )
 SELECT
-       o.owner,
+       o.owner                                                                   AS schema_name,
        o.segment_name                                                            AS object_name,
        o.object_type,
        o.family,
        o.index_type,
        o.lob_column,
-       o.parent_owner,
+       o.parent_owner                                                            AS parent_schema,
        o.parent_table,
        o.tablespace_name,
        o.ts_kind,

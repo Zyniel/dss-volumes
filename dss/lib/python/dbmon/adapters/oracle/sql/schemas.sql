@@ -1,11 +1,11 @@
--- dbmon template "schemas": one row per schema and tablespace it is tied to:
+-- dbmon Oracle adapter, fact "schemas": one row per schema and tablespace it is tied to:
 -- its default tablespace, the tablespaces where it holds a quota, and those where
 -- it still has dropped objects in the recycle bin.
 -- Live space per schema and tablespace is not read here: sum the objects result on
 -- (schema_uid, tablespace_uid) instead of scanning DBA_SEGMENTS a second time.
 -- Identity columns are added by the engine.
--- Rendered by dbmon/queries.py, not runnable as-is. Placeholders:
---   owner_filter     schemas in scope (default: non Oracle-maintained)
+-- Rendered by dbmon/adapters/oracle, not runnable as-is. Placeholders:
+--   scope_filter     schemas in scope (default: non Oracle-maintained)
 --
 --   is_default_ts      Y for the schema's default tablespace
 --   quota_status       UNLIMITED (quota -1 or UNLIMITED TABLESPACE), LIMITED or NONE
@@ -16,7 +16,7 @@ WITH
 scope AS (
   SELECT u.username, u.account_status, u.default_tablespace, u.temporary_tablespace
   FROM   dba_users u
-  WHERE  {{owner_filter}}
+  WHERE  {{scope_filter}}
 ),
 quotas AS (
   SELECT q.username, q.tablespace_name, q.bytes, q.max_bytes
@@ -49,7 +49,8 @@ pairs AS (
   UNION
   SELECT r.owner, r.tablespace_name FROM rbin r
 )
-SELECT p.owner,
+SELECT p.owner                                                                    AS schema_name,
+       p.owner,
        s.account_status,
        s.default_tablespace,
        s.temporary_tablespace,
@@ -64,7 +65,7 @@ SELECT p.owner,
        ROUND(q.bytes / 1048576, 3)                                                AS quota_used_mb,
        NVL(r.rb_objects, 0)                                                       AS recyclebin_objects,
        NVL(r.rb_tables, 0)                                                        AS recyclebin_tables,
-       ROUND(NVL(r.rb_blocks, 0) * t.block_size / 1048576, 3)                     AS recyclebin_mb,
+       ROUND(NVL(r.rb_blocks, 0) * t.block_size / 1048576, 3)                     AS reclaimable_mb,
        TO_DATE(r.rb_oldest_droptime DEFAULT NULL ON CONVERSION ERROR,
                'YYYY-MM-DD:HH24:MI:SS')                                           AS recyclebin_oldest_drop
 FROM   pairs p
