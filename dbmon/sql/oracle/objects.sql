@@ -20,7 +20,8 @@
 -- n_segments     segments summed in the row
 -- size_mb        allocated space
 -- compression    table: NONE, BASIC, ADVANCED, QUERY LOW|HIGH, ARCHIVE LOW|HIGH (HCC)
---                index: DBA_INDEXES.COMPRESSION. LOB: SECUREFILE <level> or BASICFILE
+--                index: NONE, ENABLED (prefix), ADVANCED LOW|HIGH
+--                LOB: SECUREFILE <level> or BASICFILE
 --                Several values when the partitions differ
 -- Needs SELECT_CATALOG_ROLE (or SELECT ANY DICTIONARY).
 -- =============================================================================
@@ -111,7 +112,7 @@ res AS (
            WHEN g.segment_type IN ('TABLE', 'NESTED TABLE')
              THEN DECODE(t.compression, 'ENABLED', t.compress_for, 'NONE')
            WHEN i.index_name IS NOT NULL
-             THEN i.compression
+             THEN DECODE(i.compression, 'DISABLED', 'NONE', i.compression)
            WHEN l.segment_name IS NOT NULL
              THEN DECODE(l.securefile, 'YES', 'SECUREFILE ' || l.compression, 'BASICFILE')
          END                                                                          AS compression
