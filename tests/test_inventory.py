@@ -117,4 +117,18 @@ check("DSS location as rank 1, the settings as fallback candidates",
 check("DSS location not readable: noted on the candidates",
       "DSS location not readable" in locations[locations.dataset_name == "orders_clean"].note.iloc[0])
 
+
+# --- projects read in parallel give the same outputs as one after the other ------------------
+in_parallel = inventory.collect_inventory(FakeClient(), DATABASES, role_settings, parallel=4)
+one_by_one = inventory.collect_inventory(FakeClient(), DATABASES, role_settings, parallel=1)
+for name in in_parallel:
+    parallel_rows = in_parallel[name]
+    sequential_rows = one_by_one[name]
+    if "seconds" in parallel_rows.columns:
+        parallel_rows = parallel_rows.drop(columns="seconds")
+        sequential_rows = sequential_rows.drop(columns="seconds")
+    same = parallel_rows.fillna("-").astype(str).equals(sequential_rows.fillna("-").astype(str))
+    check("parallel = 4 and parallel = 1 give the same %s, same order" % name, same)
+check("inventory_log: seconds per project", in_parallel["inventory_log"]["seconds"].notna().all())
+
 finish()

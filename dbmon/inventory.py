@@ -27,6 +27,8 @@ DSS_LOCATION comes first, the settings follow as fallback candidates.
 """
 import json
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 
@@ -58,7 +60,7 @@ LOCATION_COLUMNS = ["project_key", "dataset_name", "candidate_rank", "candidate_
 # All projects
 # ---------------------------------------------------------------------------------------
 
-def collect_inventory(client, databases, role_settings, read_location=None):
+def collect_inventory(client, databases, role_settings, read_location=None, parallel=4):
     """Read every project of the DSS instance.
 
     client         dataikuapi client with an admin API key (dataiku.api_client() in DSS)
@@ -67,38 +69,37 @@ def collect_inventory(client, databases, role_settings, read_location=None):
     read_location  optional function (project_key, dataset_name) -> location info dict,
                    DSS's own resolved location (dataiku.Dataset.get_location_info). None:
                    candidates from the settings only
+    parallel       projects read at the same time. 1: one after the other
 
-    Returns {result name: DataFrame}.
+    Returns {result name: DataFrame}. The rows keep the order of the project list.
     """
     instance_variables = read_instance_variables(client)
+    project_list = client.list_projects()
+
+    workers = int(parallel)
+    if workers < 1:
+        workers = 1
+
+    def read_one(project):
+        return read_one_project(client, project, instance_variables, read_location)
+
+    # Read the projects, up to `workers` at the same time. map() keeps their order.
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        outcomes = list(pool.map(read_one, project_list))
 
     projects = []
     links = []
     datasets = []
     dss_locations = {}
     log_entries = []
-    for project in client.list_projects():
-        project_key = project["projectKey"]
-        log_entry = {"project_key": project_key, "status": "OK", "error": None}
-        try:
-            project_row, project_links, project_datasets = read_project(client, project, instance_variables)
-        except Exception as error:
-            log_entry["status"] = "FAILED"
-            log_entry["error"] = str(error)[:2000]  # first 2000 characters
-            print("FAILED %s: %s" % (project_key, error))
-            log_entries.append(log_entry)
-            continue
-
-        projects.append(project_row)
-        links.extend(project_links)
-        datasets.extend(project_datasets)
-        if read_location is not None:
-            for dataset in project_datasets:
-                key = (project_key, dataset["dataset_name"])
-                dss_locations[key] = read_dss_location(read_location, project_key, dataset["dataset_name"])
-        log_entry["datasets"] = len(project_datasets)
-        log_entry["links"] = len(project_links)
-        log_entries.append(log_entry)
+    for outcome in outcomes:
+        log_entries.append(outcome["log_entry"])
+        if outcome["project_row"] is None:
+            continue  # this project failed
+        projects.append(outcome["project_row"])
+        links.extend(outcome["links"])
+        datasets.extend(outcome["datasets"])
+        dss_locations.update(outcome["dss_locations"])
 
     connections = read_connections(client)
     locations = dataset_locations(datasets, connections, databases, role_settings, dss_locations)
@@ -111,6 +112,42 @@ def collect_inventory(client, databases, role_settings, read_location=None):
         "dss_dataset_locations": pd.DataFrame(locations, columns=LOCATION_COLUMNS),
         "inventory_log": pd.DataFrame(log_entries),
     }
+
+
+def read_one_project(client, project, instance_variables, read_location):
+    """Everything read from one project, as a dict: log_entry, project_row (None when the
+    project failed), links, datasets, dss_locations."""
+    project_key = project["projectKey"]
+    started = time.time()
+    outcome = {
+        "log_entry": {"project_key": project_key, "status": "OK", "error": None},
+        "project_row": None,
+        "links": [],
+        "datasets": [],
+        "dss_locations": {},
+    }
+
+    try:
+        project_row, project_links, project_datasets = read_project(client, project, instance_variables)
+    except Exception as error:
+        outcome["log_entry"]["status"] = "FAILED"
+        outcome["log_entry"]["error"] = str(error)[:2000]  # first 2000 characters
+        outcome["log_entry"]["seconds"] = round(time.time() - started, 1)
+        print("FAILED %s: %s" % (project_key, error))
+        return outcome
+
+    if read_location is not None:
+        for dataset in project_datasets:
+            key = (project_key, dataset["dataset_name"])
+            outcome["dss_locations"][key] = read_dss_location(read_location, project_key, dataset["dataset_name"])
+
+    outcome["project_row"] = project_row
+    outcome["links"] = project_links
+    outcome["datasets"] = project_datasets
+    outcome["log_entry"]["datasets"] = len(project_datasets)
+    outcome["log_entry"]["links"] = len(project_links)
+    outcome["log_entry"]["seconds"] = round(time.time() - started, 1)
+    return outcome
 
 
 # ---------------------------------------------------------------------------------------

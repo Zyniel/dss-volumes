@@ -21,6 +21,10 @@ import dataiku
 
 from dbmon import inventory, schemas
 
+# Projects read at the same time. 1: one after the other. Each project is a few admin API
+# calls plus one per dataset (metrics): lower it if the DSS backend is busy during the run.
+PARALLEL = 4
+
 # Also ask DSS for the location it resolves itself (dataiku.Dataset.get_location_info).
 # False: resolve from the dataset and connection settings only.
 USE_DSS_LOCATION = True
@@ -58,7 +62,7 @@ if USE_DSS_LOCATION:
     location_reader = read_location
 
 client = dataiku.api_client()
-results = inventory.collect_inventory(client, databases, role_settings, location_reader)
+results = inventory.collect_inventory(client, databases, role_settings, location_reader, parallel=PARALLEL)
 
 # ---------------------------------------------------------------------------------------
 # Write, every row starting with the day of the run. Every output gets its declared schema

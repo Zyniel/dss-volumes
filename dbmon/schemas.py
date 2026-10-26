@@ -166,6 +166,7 @@ SCHEMAS = {
         ("error", "string"),
         ("datasets", "bigint"),
         ("links", "bigint"),
+        ("seconds", "double"),
     ],
 }
 
