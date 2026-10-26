@@ -1,30 +1,29 @@
-"""Inventory of the DSS datasets involved in recipes, and of where they are stored.
+"""Inventory of DSS: projects, datasets, flow links, connections, and where each SQL dataset
+may be stored. Read through the DSS public API, with an admin API key. Notebooks are not read.
 
-Read through the DSS public API, with an admin API key. Notebooks are not read.
+Results (step 2, extraction only: nothing here reads the step 1 tables):
+- dss_projects           one row per project: tags, use case and where it comes from
+- dss_datasets           one row per dataset: settings, storage as configured, sharing, metrics
+- dss_flow_links         one row per recipe input or output (the flow graph of every project)
+- dss_connections        one row per connection: where it points (no secret)
+- dss_dataset_locations  one row per dataset and candidate schema, best candidate first
+- inventory_log          one row per project: OK or FAILED
 
-Results:
-- dss_flow_links   one row per recipe input or output (the flow graph of every project)
-- dss_datasets     one row per dataset: settings, storage, flow role, sharing, metrics
-- dss_connections  one row per connection: where it points
-- inventory_log    one row per project: OK or FAILED
+The step 3 SQL matches dss_dataset_locations against the step 1 tables, computes the flow
+roles from dss_flow_links, and the ownership of the tables.
 
-Flow role of a dataset, over the recipes of every project:
-- target   output of at least one recipe
-- source   input of at least one recipe, output of none
-- orphan   neither input nor output of any recipe
-
-Where a SQL dataset points to: the schema is resolved in this order, the first one that
-gives a value wins (schema_source):
-1. DATASET             the dataset's own schema setting
-2. CONNECTION_DEFAULT  the default schema of the connection
-3. JDBC_PROPERTY       the JDBC property currentSchema (PostgreSQL)
-4. POST_CONNECT        ALTER SESSION SET CURRENT_SCHEMA / SET search_path in the
+Candidate schemas of a SQL dataset, in the order the database would use them
+(schema_source):
+1. DSS_LOCATION        the location DSS resolves itself, when the recipe can read it
+2. DATASET             the dataset's own schema setting
+3. CONNECTION_DEFAULT  the default schema of the connection
+4. JDBC_PROPERTY       the JDBC property currentSchema (PostgreSQL)
+5. POST_CONNECT        ALTER SESSION SET CURRENT_SCHEMA / SET search_path in the
                        connection's post-connect statements
-5. PER_USER            the connection logs in as each DSS user: cannot be told
 6. LOGIN_USER          Oracle: the schema of the login user
-   SEARCH_PATH         PostgreSQL: the search_path of the login user (role_settings),
-                       by default "$user", public
-The candidate schemas are then checked against the tables collected in step 1.
+   SEARCH_PATH         PostgreSQL: the search_path of the login user (role_settings), by
+                       default "$user", public: one candidate per schema of the path
+DSS_LOCATION comes first, the settings follow as fallback candidates.
 """
 import json
 import re
@@ -49,57 +48,67 @@ ORACLE_CURRENT_SCHEMA = re.compile(r"ALTER\s+SESSION\s+SET\s+CURRENT_SCHEMA\s*=\
 POSTGRES_SEARCH_PATH = re.compile(r"SET\s+(?:SESSION\s+)?search_path\s*(?:=|TO)\s*(.+?);?\s*$", re.IGNORECASE)
 VARIABLE = re.compile(r"\$\{([^}]+)\}")
 
+LINK_COLUMNS = ["project_key", "recipe_name", "recipe_type", "direction",
+                "dataset_project", "dataset_name", "foreign"]
+LOCATION_COLUMNS = ["project_key", "dataset_name", "candidate_rank", "candidate_status",
+                    "database_label", "schema_name", "table_name", "schema_source", "note"]
+
 
 # ---------------------------------------------------------------------------------------
 # All projects
 # ---------------------------------------------------------------------------------------
 
-def collect_inventory(client, databases, tables, role_settings, read_location=None):
+def collect_inventory(client, databases, role_settings, read_location=None):
     """Read every project of the DSS instance.
 
     client         dataikuapi client with an admin API key (dataiku.api_client() in DSS)
     databases      the databases dataset: maps DSS connections to the monitored databases
-    tables         the tables collected in step 1 (one snapshot)
     role_settings  the role settings collected in step 1 (one snapshot)
     read_location  optional function (project_key, dataset_name) -> location info dict,
                    DSS's own resolved location (dataiku.Dataset.get_location_info). None:
-                   the location is resolved from the settings only
+                   candidates from the settings only
 
     Returns {result name: DataFrame}.
     """
     instance_variables = read_instance_variables(client)
 
+    projects = []
     links = []
     datasets = []
+    dss_locations = {}
     log_entries = []
     for project in client.list_projects():
         project_key = project["projectKey"]
         log_entry = {"project_key": project_key, "status": "OK", "error": None}
         try:
-            project_links, project_datasets = read_project(client, project, instance_variables, read_location)
+            project_row, project_links, project_datasets = read_project(client, project, instance_variables)
         except Exception as error:
             log_entry["status"] = "FAILED"
             log_entry["error"] = str(error)[:2000]  # first 2000 characters
             print("FAILED %s: %s" % (project_key, error))
-        else:
-            links.extend(project_links)
-            datasets.extend(project_datasets)
-            log_entry["datasets"] = len(project_datasets)
-            log_entry["links"] = len(project_links)
+            log_entries.append(log_entry)
+            continue
+
+        projects.append(project_row)
+        links.extend(project_links)
+        datasets.extend(project_datasets)
+        if read_location is not None:
+            for dataset in project_datasets:
+                key = (project_key, dataset["dataset_name"])
+                dss_locations[key] = read_dss_location(read_location, project_key, dataset["dataset_name"])
+        log_entry["datasets"] = len(project_datasets)
+        log_entry["links"] = len(project_links)
         log_entries.append(log_entry)
 
-    links = pd.DataFrame(links, columns=LINK_COLUMNS)
-    datasets = pd.DataFrame(datasets)
     connections = read_connections(client)
-
-    if not datasets.empty:
-        add_flow_roles(datasets, links)
-        add_locations(datasets, connections, databases, tables, role_settings)
+    locations = dataset_locations(datasets, connections, databases, role_settings, dss_locations)
 
     return {
-        "dss_flow_links": links,
-        "dss_datasets": datasets,
+        "dss_projects": pd.DataFrame(projects),
+        "dss_datasets": pd.DataFrame(datasets),
+        "dss_flow_links": pd.DataFrame(links, columns=LINK_COLUMNS),
         "dss_connections": connections,
+        "dss_dataset_locations": pd.DataFrame(locations, columns=LOCATION_COLUMNS),
         "inventory_log": pd.DataFrame(log_entries),
     }
 
@@ -108,17 +117,21 @@ def collect_inventory(client, databases, tables, role_settings, read_location=No
 # One project
 # ---------------------------------------------------------------------------------------
 
-LINK_COLUMNS = ["project_key", "recipe_name", "recipe_type", "direction",
-                "dataset_project", "dataset_name", "foreign"]
-
-
-def read_project(client, project, instance_variables, read_location):
-    """Flow links and datasets of one project. Returns (links, datasets), lists of dicts."""
+def read_project(client, project, instance_variables):
+    """(project row, flow links, datasets) of one project."""
     project_key = project["projectKey"]
     project_handle = client.get_project(project_key)
 
     tags = project.get("tags", [])
-    project_use_case = use_case.project_use_case(project_key, tags)
+    project_use_case, use_case_source = use_case.project_use_case_and_source(project_key, tags)
+    project_row = {
+        "project_key": project_key,
+        "project_name": project.get("name"),
+        "project_tags": join_values(tags, keep_order=True),
+        "use_case": project_use_case,
+        "use_case_source": use_case_source,
+    }
+
     variables = read_project_variables(project_handle, project_key, instance_variables)
     shared_with = read_exposed_datasets(project_handle)
     links = read_flow_links(project_handle, project_key)
@@ -135,15 +148,13 @@ def read_project(client, project, instance_variables, read_location):
 
         dataset = {
             "project_key": project_key,
-            "project_tags": ",".join(tags),
-            "use_case": project_use_case,
             "dataset_name": dataset_name,
             "dataset_type": raw.get("type"),
             "managed": yes_no(raw.get("managed", False)),
             "partitioned": yes_no(len(dimensions) > 0),
-            "partition_dimensions": join_values(dimensions),
-            "connection": params.get("connection"),
-            "mode": params.get("mode"),
+            "partition_dimensions": join_values(dimensions, keep_order=True),
+            "connection": first_value(params, ["connection"]),
+            "mode": first_value(params, ["mode"]),
             "schema": first_value(params, ["schema"]),
             "table": first_value(params, ["table"]),
             "catalog": first_value(params, ["catalog"]),
@@ -155,19 +166,19 @@ def read_project(client, project, instance_variables, read_location):
         dataset["resolved_table"] = substitute_variables(dataset["table"], variables)
         dataset["resolved_path"] = substitute_variables(dataset["path"], variables)
 
-        # DSS's own resolved location, when it can be read
-        if read_location is not None:
-            add_dss_location(dataset, read_location)
-
         # Sharing
         targets = shared_with.get(dataset_name, [])
         dataset["shared"] = yes_no(len(targets) > 0)
         dataset["shared_with"] = join_values(targets)
 
         # Metrics last computed by DSS
-        metrics = project_handle.get_dataset(dataset_name).get_last_metric_values("ALL" if dimensions else "")
-        dataset["metric_rows"] = metric_value(metrics.get_raw(), METRIC_ROWS)
-        size_bytes = metric_value(metrics.get_raw(), METRIC_SIZE)
+        partition = ""
+        if dimensions:
+            partition = "ALL"
+        metrics = project_handle.get_dataset(dataset_name).get_last_metric_values(partition)
+        raw_metrics = metrics.get_raw()
+        dataset["metric_rows"] = metric_value(raw_metrics, METRIC_ROWS)
+        size_bytes = metric_value(raw_metrics, METRIC_SIZE)
         dataset["metric_size"] = None
         if size_bytes is not None:
             dataset["metric_size"] = round(size_bytes / 1048576.0, 3)
@@ -175,7 +186,7 @@ def read_project(client, project, instance_variables, read_location):
 
         datasets.append(dataset)
 
-    return links, datasets
+    return project_row, links, datasets
 
 
 def read_flow_links(project_handle, project_key):
@@ -212,10 +223,11 @@ def dataset_reference(node, node_id, project_key):
     """(project, dataset name) of a dataset node. A dataset of another project is written
     PROJECT.name, or carries its projectKey."""
     reference = node.get("ref", node_id)
-    if node.get("projectKey") and node["projectKey"] != project_key:
-        if reference.startswith(node["projectKey"] + "."):
-            reference = reference[len(node["projectKey"]) + 1:]
-        return node["projectKey"], reference
+    owner = node.get("projectKey")
+    if owner and owner != project_key:
+        if reference.startswith(owner + "."):
+            reference = reference[len(owner) + 1:]
+        return owner, reference
     if "." in reference:
         owner, name = reference.split(".", 1)
         return owner, name
@@ -257,70 +269,14 @@ def read_instance_variables(client):
     return result
 
 
-def add_dss_location(dataset, read_location):
-    """Overwrite the resolved schema and table with DSS's own location, when DSS gives one."""
+def read_dss_location(read_location, project_key, dataset_name):
+    """DSS's own location of a dataset: {"schema", "table"} or {"error"}."""
     try:
-        location = read_location(dataset["project_key"], dataset["dataset_name"])
+        location = read_location(project_key, dataset_name)
     except Exception as error:
-        dataset["location_note"] = "DSS location not readable: %s" % str(error)[:200]
-        return
-
+        return {"error": str(error)[:200]}
     info = location.get("info", {})
-    if info.get("schema"):
-        dataset["resolved_schema"] = info["schema"]
-        dataset["schema_source"] = "DSS_LOCATION"
-    if info.get("table"):
-        dataset["resolved_table"] = info["table"]
-    if info.get("path"):
-        dataset["resolved_path"] = info["path"]
-
-
-# ---------------------------------------------------------------------------------------
-# Flow roles
-# ---------------------------------------------------------------------------------------
-
-def add_flow_roles(datasets, links):
-    """Add flow_role, n_producers, n_consumers and used_by_projects to datasets (in place)."""
-    producers = {}
-    consumers = {}
-    consuming_projects = {}
-    for link in links.itertuples(index=False):
-        key = (link.dataset_project, link.dataset_name)
-        if link.direction == "output":
-            if key not in producers:
-                producers[key] = 0
-            producers[key] = producers[key] + 1
-        else:
-            if key not in consumers:
-                consumers[key] = 0
-            consumers[key] = consumers[key] + 1
-            if link.project_key != link.dataset_project:
-                if key not in consuming_projects:
-                    consuming_projects[key] = set()
-                consuming_projects[key].add(link.project_key)
-
-    roles = []
-    n_producers = []
-    n_consumers = []
-    used_by = []
-    for dataset in datasets.itertuples(index=False):
-        key = (dataset.project_key, dataset.dataset_name)
-        produced = producers.get(key, 0)
-        consumed = consumers.get(key, 0)
-        if produced > 0:
-            roles.append("target")
-        elif consumed > 0:
-            roles.append("source")
-        else:
-            roles.append("orphan")
-        n_producers.append(produced)
-        n_consumers.append(consumed)
-        used_by.append(join_values(consuming_projects.get(key, set())))
-
-    datasets["flow_role"] = roles
-    datasets["n_producers"] = n_producers
-    datasets["n_consumers"] = n_consumers
-    datasets["used_by_projects"] = used_by
+    return {"schema": info.get("schema"), "table": info.get("table")}
 
 
 # ---------------------------------------------------------------------------------------
@@ -331,12 +287,10 @@ def read_connections(client):
     """One row per connection of the instance: where it points (no secret)."""
     rows = []
     for name in client.list_connections(as_type="dictitems"):
-        row = {"connection": name}
         try:
             info = client.get_connection(name).get_info()
         except Exception as error:
-            row["error"] = str(error)[:500]
-            rows.append(row)
+            rows.append({"connection": name, "error": str(error)[:500]})
             continue
         rows.append(connection_row(name, info))
     return pd.DataFrame(rows)
@@ -357,6 +311,7 @@ def connection_row(name, info):
     login_user = first_value(credential, ["user"])
     if login_user is None:
         login_user = first_value(params, ["user"])
+
     properties = {}
     for prop in params.get("properties", []):
         prop_name = prop.get("name", "")
@@ -368,7 +323,7 @@ def connection_row(name, info):
     if not post_connect and params.get("postConnectStatements"):
         post_connect = [params["postConnectStatements"]]
 
-    return {
+    row = {
         "connection": name,
         "connection_type": info.get("type"),
         "credentials_mode": info.get("credentialsMode"),
@@ -377,10 +332,17 @@ def connection_row(name, info):
         "database_or_service": first_value(params, ["db", "serviceName", "sid"]),
         "login_user": login_user,
         "default_schema": first_value(params, ["defaultSchema", "schema"]),
-        "jdbc_properties": json.dumps(properties, sort_keys=True) if properties else None,
-        "post_connect_statements": json.dumps(post_connect) if post_connect else None,
-        "naming_rule": json.dumps(params.get("namingRule"), sort_keys=True) if params.get("namingRule") else None,
+        "jdbc_properties": None,
+        "post_connect_statements": None,
+        "naming_rule": None,
     }
+    if properties:
+        row["jdbc_properties"] = json.dumps(properties, sort_keys=True)
+    if post_connect:
+        row["post_connect_statements"] = json.dumps(post_connect)
+    if params.get("namingRule"):
+        row["naming_rule"] = json.dumps(params["namingRule"], sort_keys=True)
+    return row
 
 
 def is_secret(name):
@@ -392,93 +354,110 @@ def is_secret(name):
 
 
 # ---------------------------------------------------------------------------------------
-# Where a dataset points to
+# Candidate locations of the datasets
 # ---------------------------------------------------------------------------------------
 
-def add_locations(datasets, connections, databases, tables, role_settings):
-    """Add database_label, schema_source, schema_candidates, location_status and
-    location_note to datasets (in place)."""
+def dataset_locations(datasets, connections, databases, role_settings, dss_locations):
+    """Rows of dss_dataset_locations for every dataset (list of dicts).
+
+    candidate_status
+      CANDIDATE   a candidate schema and table, to look up in the step 1 tables
+      UNMAPPED    candidates exist, but the connection is not listed in databases
+      PER_USER    the connection logs in as each DSS user: no candidate
+      UNRESOLVED  a variable could not be replaced, or no login user: no candidate
+      NO_TABLE    SQL query dataset: no table
+      NOT_SQL     not stored in Oracle or PostgreSQL
+    """
     connection_by_name = {}
-    for row in connections.to_dict("records"):
-        connection_by_name[row["connection"]] = without_missing(row)
-
+    if not connections.empty:
+        for row in connections.to_dict("records"):
+            connection_by_name[row["connection"]] = without_missing(row)
     label_by_connection = database_labels(databases)
-    table_index = index_tables(tables)
 
-    new_columns = {"database_label": [], "schema_source": [], "schema_candidates": [],
-                   "location_status": [], "location_note": [], "resolved_schema": []}
-    for dataset in datasets.to_dict("records"):
-        dataset = without_missing(dataset)
-        result = locate(dataset, connection_by_name, label_by_connection, table_index, role_settings)
-        for column in new_columns:
-            new_columns[column].append(result[column])
-
-    for column in new_columns:
-        datasets[column] = new_columns[column]
+    rows = []
+    for dataset in datasets:
+        key = (dataset["project_key"], dataset["dataset_name"])
+        connection = connection_by_name.get(dataset.get("connection"), {})
+        label = label_by_connection.get(dataset.get("connection"))
+        dss_location = dss_locations.get(key)
+        rows.extend(locations_of(dataset, connection, label, role_settings, dss_location))
+    return rows
 
 
-def locate(dataset, connection_by_name, label_by_connection, table_index, role_settings):
-    """Where one dataset points to. Returns the values of the location columns."""
-    result = {
-        "database_label": None,
-        "schema_source": dataset.get("schema_source"),
-        "schema_candidates": None,
-        "location_status": None,
-        "location_note": dataset.get("location_note"),
-        "resolved_schema": dataset.get("resolved_schema"),
+def locations_of(dataset, connection, label, role_settings, dss_location):
+    """Candidate rows of one dataset."""
+    base = {
+        "project_key": dataset["project_key"],
+        "dataset_name": dataset["dataset_name"],
+        "candidate_rank": None,
+        "candidate_status": None,
+        "database_label": label,
+        "schema_name": None,
+        "table_name": dataset.get("resolved_table"),
+        "schema_source": None,
+        "note": None,
     }
 
     engine = SQL_DATASET_TYPES.get(dataset.get("dataset_type"))
     if engine is None:
-        result["location_status"] = "NOT_SQL"
-        return result
+        return [without_candidate(base, "NOT_SQL", "not stored in Oracle or PostgreSQL")]
     if dataset.get("mode") == "query" or not dataset.get("resolved_table"):
-        result["location_status"] = "NO_TABLE"
-        result["location_note"] = "SQL query dataset, no table"
-        return result
-    has_variable_left = False
-    for value in (dataset.get("resolved_table"), dataset.get("resolved_schema")):
-        if value is not None and "${" in value:
-            has_variable_left = True
-    if has_variable_left:
-        result["location_status"] = "UNRESOLVED"
-        result["location_note"] = "variable that could not be replaced"
-        return result
+        return [without_candidate(base, "NO_TABLE", "SQL query dataset, no table")]
 
-    connection = connection_by_name.get(dataset.get("connection"), {})
-    result["database_label"] = label_by_connection.get(dataset.get("connection"))
+    note = None
+    if dss_location is not None and dss_location.get("error"):
+        note = "DSS location not readable: %s" % dss_location["error"]
 
-    # The candidate schemas, in the order the database would try them
-    if result["schema_source"] == "DSS_LOCATION":
-        candidates = [result["resolved_schema"]]
+    # (schema_source, schema, table), best first
+    candidates = []
+    if dss_location is not None and dss_location.get("schema") and dss_location.get("table"):
+        candidates.append(("DSS_LOCATION", dss_location["schema"], dss_location["table"]))
+
+    if has_variable_left(dataset.get("resolved_table")) or has_variable_left(dataset.get("resolved_schema")):
+        if not candidates:
+            return [without_candidate(base, "UNRESOLVED", "variable that could not be replaced")]
     else:
-        source, candidates, note = schema_candidates(dataset, connection, engine, role_settings)
-        result["schema_source"] = source
-        if note:
-            result["location_note"] = note
-    result["schema_candidates"] = join_values(candidates, keep_order=True)
+        source, schemas, settings_note = schema_candidates(dataset, connection, engine, role_settings)
+        if settings_note is not None and note is None:
+            note = settings_note
+        for schema in schemas:
+            candidates.append((source, schema, dataset["resolved_table"]))
+        if not candidates:
+            return [without_candidate(base, source, note)]
 
-    if not candidates:
-        result["location_status"] = "UNRESOLVED"
-        return result
-    if result["database_label"] is None:
-        result["location_status"] = "UNMAPPED"
-        result["location_note"] = "connection not listed in the databases dataset"
-        result["resolved_schema"] = candidates[0]
-        return result
+    status = "CANDIDATE"
+    if label is None:
+        status = "UNMAPPED"
+        note = "connection not listed in the databases dataset"
 
-    # Check the candidates against the tables of the database
-    status, schema = find_table(result["database_label"], candidates, dataset["resolved_table"], table_index)
-    result["location_status"] = status
-    if schema is not None:
-        result["resolved_schema"] = schema
-    else:
-        result["resolved_schema"] = candidates[0]
-    return result
+    rows = []
+    rank = 0
+    for source, schema, table in candidates:
+        rank = rank + 1
+        row = dict(base)
+        row["candidate_rank"] = rank
+        row["candidate_status"] = status
+        row["schema_name"] = schema
+        row["table_name"] = table
+        row["schema_source"] = source
+        row["note"] = note
+        rows.append(row)
+    return rows
+
+
+def without_candidate(base, status, note):
+    """The single row of a dataset without candidate schema."""
+    row = dict(base)
+    row["candidate_status"] = status
+    if status in ("PER_USER", "UNRESOLVED"):
+        row["schema_source"] = status
+    row["note"] = note
+    return row
 
 
 def schema_candidates(dataset, connection, engine, role_settings):
-    """(schema_source, candidate schemas, note) for a SQL dataset."""
+    """(schema_source, candidate schemas, note) from the settings of a SQL dataset.
+    No candidate: schema_source is PER_USER or UNRESOLVED."""
     if dataset.get("resolved_schema"):
         return "DATASET", [dataset["resolved_schema"]], None
 
@@ -530,7 +509,8 @@ def user_search_path(login_user, database, role_settings):
     precise_first = [(login_user, database), (login_user, None), (None, database)]
     for role, setting_database in precise_first:
         for row in role_settings.to_dict("records"):
-            if same_or_both_empty(row.get("role_name"), role) and same_or_both_empty(row.get("setting_database"), setting_database):
+            row = without_missing(row)
+            if row.get("role_name") == role and row.get("setting_database") == setting_database:
                 return row["search_path"]
     return '"$user", public'
 
@@ -550,49 +530,18 @@ def split_schemas(search_path, login_user):
     return schemas
 
 
-def find_table(database_label, candidates, table_name, table_index):
-    """(status, schema) of the first candidate schema holding the table: exact names first,
-    then ignoring case. AMBIGUOUS when ignoring case matches several tables."""
-    for schema in candidates:
-        if (database_label, schema, table_name) in table_index["exact"]:
-            return "FOUND", schema
-
-    for schema in candidates:
-        key = (database_label, schema.lower(), table_name.lower())
-        matches = table_index["lower"].get(key, [])
-        if len(matches) == 1:
-            return "FOUND", matches[0]
-        if len(matches) > 1:
-            return "AMBIGUOUS", None
-    return "NOT_FOUND", None
-
-
-def index_tables(tables):
-    """Lookups of the step 1 tables, by (label, schema, table): exact, and lower case."""
-    exact = set()
-    lower = {}
-    if tables is None or tables.empty:
-        return {"exact": exact, "lower": lower}
-    for row in tables[["label", "schema_name", "table_name"]].itertuples(index=False):
-        exact.add((row.label, row.schema_name, row.table_name))
-        key = (row.label, str(row.schema_name).lower(), str(row.table_name).lower())
-        if key not in lower:
-            lower[key] = []
-        lower[key].append(row.schema_name)
-    return {"exact": exact, "lower": lower}
-
-
 def database_labels(databases):
     """{DSS connection: database label}. Each row of databases maps its admin connection,
     and the connections listed in its optional column dss_connections (comma separated)."""
     labels = {}
     for row in databases.to_dict("records"):
+        row = without_missing(row)
         label = row.get("label")
-        if label is None or pd.isna(label) or str(label).strip() == "":
+        if label is None or str(label).strip() == "":
             label = row["connection"]
         labels[row["connection"]] = label
         listed = row.get("dss_connections")
-        if listed is None or pd.isna(listed):
+        if listed is None:
             continue
         for name in str(listed).split(","):
             if name.strip():
@@ -653,6 +602,10 @@ def substitute_variables(text, variables):
     return VARIABLE.sub(replace, text)
 
 
+def has_variable_left(text):
+    return text is not None and "${" in text
+
+
 def join_values(values, keep_order=False):
     """Values comma separated (sorted unless keep_order). None when there is none."""
     texts = []
@@ -693,12 +646,6 @@ def to_number(value):
         return float(value)
     except (TypeError, ValueError):
         return None
-
-
-def same_or_both_empty(value, expected):
-    if expected is None:
-        return value is None or pd.isna(value)
-    return value == expected
 
 
 def yes_no(flag):

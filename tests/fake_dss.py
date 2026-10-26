@@ -2,8 +2,10 @@
 with three projects:
 
 SALES   use case SALES. raw_orders (source) -> compute_clean -> orders_clean, orders_ora
-        (targets); orders_clean is shared with FIN. Orphans covering every location case.
-FIN     reads SALES.orders_clean -> join -> fin_summary. Schema from a project variable.
+        (targets); orders_clean is shared with FIN. Orphans covering every location case;
+        old_copy points to a table no other dataset uses (NO_FLOW).
+FIN     reads SALES.orders_clean -> join -> fin_summary -> copy -> dup_writer, which writes
+        the same table as SALES.orders_clean (two owners). Schema from a project variable.
 BROKEN  its flow graph cannot be read: the project fails.
 """
 import pandas as pd
@@ -58,6 +60,7 @@ PROJECTS = {
             dataset("per_user", "PostgreSQL", "PG_PERUSER", "", "x"),
             dataset("query_ds", "PostgreSQL", "PG_SALES", mode="query"),
             dataset("elsewhere", "PostgreSQL", "PG_UNMAPPED", "public", "t"),
+            dataset("old_copy", "PostgreSQL", "PG_SALES", "appx", "mv_totals"),
         ],
         "metrics": {
             "raw_orders": [metric("records:COUNT_RECORDS", {"NP": 3000})],
@@ -80,13 +83,16 @@ PROJECTS = {
         "datasets": [
             dataset("fin_summary", "PostgreSQL", "PG_SALES", "${finSchema}", "ledger", managed=True),
             dataset("missing", "PostgreSQL", "PG_SALES", "appx", "nope"),
+            dataset("dup_writer", "PostgreSQL", "PG_SALES", "sales_dssout", "SALES_orders", managed=True),
         ],
         "metrics": {"fin_summary": [metric("basic:SIZE", {"NP": 2097152})]},
         "graph": {
             "SALES.orders_clean": node("COMPUTABLE_DATASET", "SALES.orders_clean", successors=["join"],
                                        project_key="SALES"),
             "join": node("RUNNABLE_RECIPE", "join", ["SALES.orders_clean"], ["fin_summary"], sub_type="join"),
-            "fin_summary": node("COMPUTABLE_DATASET", "fin_summary", ["join"]),
+            "fin_summary": node("COMPUTABLE_DATASET", "fin_summary", ["join"], ["copy"]),
+            "copy": node("RUNNABLE_RECIPE", "copy", ["fin_summary"], ["dup_writer"], sub_type="sync"),
+            "dup_writer": node("COMPUTABLE_DATASET", "dup_writer", ["copy"]),
         },
     },
     "BROKEN": {"tags": [], "variables": {"standard": {}, "local": {}}, "exposed": {"objects": []},

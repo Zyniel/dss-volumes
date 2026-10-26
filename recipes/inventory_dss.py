@@ -2,14 +2,16 @@
 #
 # Run it as a user with an admin API key (scenario "Run as" an admin), after collect_storage.
 #
-# Inputs  databases       the same dataset as collect_storage. Optional column dss_connections:
-#                         the DSS connections pointing to that database, comma separated
-#         tables          from collect_storage: the latest day is used
-#         role_settings   from collect_storage: the latest day is used
-# Outputs dss_datasets    one row per dataset
-#         dss_flow_links  one row per recipe input or output
-#         dss_connections one row per connection
-#         inventory_log   one row per project: OK or FAILED
+# Inputs  databases              the same dataset as collect_storage. Optional column
+#                                dss_connections: the DSS connections pointing to that
+#                                database, comma separated
+#         role_settings          from collect_storage: the latest day is used
+# Outputs dss_projects           one row per project: tags, use case
+#         dss_datasets           one row per dataset: settings, storage, sharing, metrics
+#         dss_flow_links         one row per recipe input or output
+#         dss_connections        one row per connection
+#         dss_dataset_locations  one row per dataset and candidate schema, best first
+#         inventory_log          one row per project: OK or FAILED
 #
 # Every row starts with snapshot_day, the day of the run. Partition the outputs by day on
 # that column, like the outputs of collect_storage.
@@ -49,7 +51,6 @@ if hasattr(dataiku, "dku_flow_variables"):
 # Read
 # ---------------------------------------------------------------------------------------
 databases = dataiku.Dataset("databases").get_dataframe()
-tables = latest_day(dataiku.Dataset("tables").get_dataframe())
 role_settings = latest_day(dataiku.Dataset("role_settings").get_dataframe())
 
 location_reader = None
@@ -57,7 +58,7 @@ if USE_DSS_LOCATION:
     location_reader = read_location
 
 client = dataiku.api_client()
-results = inventory.collect_inventory(client, databases, tables, role_settings, location_reader)
+results = inventory.collect_inventory(client, databases, role_settings, location_reader)
 
 # ---------------------------------------------------------------------------------------
 # Write, every row starting with the day of the run. Every output gets its declared schema

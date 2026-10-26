@@ -127,11 +127,11 @@ except ValueError as error:
 
 # --- inventory_dss ---------------------------------------------------------------------------
 INPUTS["databases"] = DATABASES
-INPUTS["tables"] = pg_run_tables
 INPUTS["role_settings"] = pg_run_settings
 printed = run_recipe("inventory_dss.py", {"DKU_DST_snapshot_day": today})
-check("inventory: the four outputs written",
-      sorted(WRITTEN) == ["dss_connections", "dss_datasets", "dss_flow_links", "inventory_log"], sorted(WRITTEN))
+INVENTORY_OUTPUTS = ["dss_connections", "dss_dataset_locations", "dss_datasets", "dss_flow_links", "dss_projects",
+                     "inventory_log"]
+check("inventory: the six outputs written", sorted(WRITTEN) == INVENTORY_OUTPUTS, sorted(WRITTEN))
 check("inventory: summary with the failed project", "2 of 3 projects read" in printed and "FAILED BROKEN" in printed,
       printed)
 inventory_declared = True
@@ -139,17 +139,17 @@ for name in WRITTEN:
     if schema_columns(name) != declared_columns(name):
         inventory_declared = False
 check("inventory: every output written with its declared schema", inventory_declared)
-datasets = WRITTEN["dss_datasets"].set_index(["project_key", "dataset_name"])
-check("inventory: DSS location not readable, settings used, table found",
-      datasets.loc[("SALES", "raw_orders"), "location_status"] == "FOUND"
-      and "DSS location not readable" in datasets.loc[("SALES", "raw_orders"), "location_note"])
+locations = WRITTEN["dss_dataset_locations"]
+raw_orders = locations[locations.dataset_name == "raw_orders"]
+check("inventory: DSS location not readable, candidates from the settings, noted",
+      raw_orders.schema_source.iloc[0] == "SEARCH_PATH" and "DSS location not readable" in raw_orders.note.iloc[0])
 
-# Empty inputs (first run): the inventory still runs and writes its schemas
-INPUTS["tables"] = schemas.conform(pd.DataFrame(), "tables")
+# Empty role_settings (first run, or Oracle only): the inventory still runs, default search_path
 INPUTS["role_settings"] = schemas.conform(pd.DataFrame(), "role_settings")
 run_recipe("inventory_dss.py", {"DKU_DST_snapshot_day": today})
-check("inventory with empty tables and role_settings: runs, tables NOT_FOUND",
-      sorted(WRITTEN) == ["dss_connections", "dss_datasets", "dss_flow_links", "inventory_log"]
-      and "FOUND" not in set(WRITTEN["dss_datasets"].location_status))
+locations = WRITTEN["dss_dataset_locations"]
+check("inventory with empty role_settings: runs, PostgreSQL default search_path \"$user\", public",
+      sorted(WRITTEN) == INVENTORY_OUTPUTS
+      and locations[locations.dataset_name == "raw_orders"].schema_name.tolist() == ["dbmon", "public"])
 
 finish()

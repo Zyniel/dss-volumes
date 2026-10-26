@@ -15,11 +15,22 @@ def project_use_case(project_key, tags):
     project_key  DSS project key
     tags         the project's tags, as listed by the DSS API
     """
+    use_case, source = project_use_case_and_source(project_key, tags)
+    return use_case
+
+
+def project_use_case_and_source(project_key, tags):
+    """(use case, source) of a project. source: TAG (CDP-UseCase tag), RULE (current
+    criteria) or NONE (use case unknown)."""
     use_case = use_case_from_tag(tags)
     if use_case is not None:
-        return use_case
+        return use_case, "TAG"
 
-    return current_rule(project_key, tags)
+    use_case = current_rule(project_key, tags)
+    if use_case is not None:
+        return use_case, "RULE"
+
+    return None, "NONE"
 
 
 def use_case_from_tag(tags):
