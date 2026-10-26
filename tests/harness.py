@@ -147,4 +147,15 @@ def install_fake_dataiku(extra=None):
     for name in list(sys.modules):
         if name == "dbmon" or name.startswith("dbmon."):
             del sys.modules[name]
+    install_fake_jdbc_parser()
     return module
+
+
+def install_fake_jdbc_parser():
+    """Register tests/fake_jdbc_parser.py as dbmon.utils.jdbc_parser: the real library lives in
+    the professional environment, not in this repository."""
+    import fake_jdbc_parser
+    utils = types.ModuleType("dbmon.utils")
+    utils.jdbc_parser = fake_jdbc_parser
+    sys.modules["dbmon.utils"] = utils
+    sys.modules["dbmon.utils.jdbc_parser"] = fake_jdbc_parser

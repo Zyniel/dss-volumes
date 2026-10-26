@@ -166,11 +166,4 @@ check("the JDBC URL and its password are never copied", "url-secret" not in conn
 check("dataset on that connection: the URL user as Oracle login user",
       candidates("SALES", "via_url") == [("CANDIDATE", "LOGIN_USER", "SALES_DSSOUT", "LEDGER")], candidates("SALES", "via_url"))
 
-from dbmon.utils.jdbc_parser import parse_jdbc  # noqa: E402
-parsed = parse_jdbc("jdbc:postgresql://pg.example:5432/appdb?user=dbmon&ssl=true")
-check("parser stub: PostgreSQL URL", [parsed.vendor, parsed.host, parsed.port, parsed.database, parsed.user]
-      == ["postgresql", "pg.example", "5432", "appdb", "dbmon"])
-parsed = parse_jdbc("jdbc:oracle:thin:@dbhost:1521:ORCL")
-check("parser stub: Oracle SID URL", [parsed.vendor, parsed.host, parsed.port, parsed.database] == ["oracle", "dbhost", "1521", "ORCL"])
-
 finish()

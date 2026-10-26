@@ -1,14 +1,12 @@
-"""STUB. Stands in for the jdbc_parser library of the professional environment, which replaces
-this file. Keep the same interface: parse_jdbc(url) returns a JdbcInfo.
-
-This stand-in only knows the common Oracle thin and PostgreSQL URL forms, enough for the
-tests:
+"""Test stand-in for dbmon.utils.jdbc_parser, the library of the professional environment
+(not in this repository). harness.install_fake_dataiku registers it under that module name.
+Same interface: parse_jdbc(url) returns a JdbcInfo. It only knows the common Oracle thin and
+PostgreSQL URL forms used by the tests:
     jdbc:oracle:thin:@//host:port/service
     jdbc:oracle:thin:@host:port/service
     jdbc:oracle:thin:@host:port:SID
-    jdbc:oracle:thin:user/password@//host:port/service   (the password is never kept)
+    jdbc:oracle:thin:user/password@//host:port/service
     jdbc:postgresql://host:port/database?user=name
-Anything else gives a JdbcInfo with the vendor only.
 """
 import re
 from dataclasses import dataclass

@@ -1,6 +1,6 @@
 # Tests
 
-Run against two local test databases in Docker. No DSS is needed: `harness.py` stands in for the `dataiku` module and runs the SQL inside the containers, and `fake_dss.py` stands in for the DSS API client.
+Run against two local test databases in Docker. No DSS is needed: `harness.py` stands in for the `dataiku` module and runs the SQL inside the containers, `fake_dss.py` stands in for the DSS API client, and `fake_jdbc_parser.py` for the `dbmon.utils.jdbc_parser` library of the environment.
 
 ```
 python tests/setup_containers.py     # start the containers, load the test data (safe to run again)
