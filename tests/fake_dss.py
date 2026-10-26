@@ -116,9 +116,13 @@ CONNECTIONS = {
                     "resolvedParams": {"host": "x", "db": "x", "user": "u"}},
     "ORA_SALES": {"type": "Oracle", "credentialsMode": "GLOBAL",
                   "resolvedParams": {"host": "ora", "port": 1521, "db": "FREEPDB1", "user": "sales_dsswork"}},
-    # defined by a JDBC URL only, with a password inside: never copied
+    # "useURL" ticked after the fields were filled: DSS uses the URL, the fields are left over
     "ORA_URL": {"type": "Oracle", "credentialsMode": "GLOBAL",
-                "resolvedParams": {"useURL": True, "url": "jdbc:oracle:thin:sales_dssout/url-secret@//ora:1521/FREEPDB1"}},
+                "resolvedParams": {"useURL": True, "host": "old-host", "port": 1600, "db": "OLDSVC",
+                                   "url": "jdbc:oracle:thin:sales_dssout/url-secret@//ora:1521/FREEPDB1"}},
+    # a JDBC URL typed into the host field, "useURL" not ticked
+    "PG_HOST_URL": {"type": "PostgreSQL", "credentialsMode": "GLOBAL",
+                    "resolvedParams": {"host": "jdbc:postgresql://pg:5432/appdb?ssl=true&password=p1", "user": "dbmon"}},
     "filesystem_managed": {"type": "Filesystem", "resolvedParams": {"root": "/data/managed"}},
 }
 

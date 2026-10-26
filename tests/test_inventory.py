@@ -97,10 +97,10 @@ check("database label from dss_connections, spaces ignored",
 
 connections = results["dss_connections"].set_index("connection")
 check("connections: login user, credentials mode, no password copied",
-      connections.loc["PG_SALES", "login_user"] == "dbmon"
+      connections.loc["PG_SALES", "effective_user"] == "dbmon"
       and connections.loc["PG_PERUSER", "credentials_mode"] == "PER_USER"
       and "hidden" not in connections.to_string() and "never-copied" not in connections.to_string()
-      and connections.loc["PG_SALES", "jdbc_properties"] == '{"ssl": "true"}', connections.to_string())
+      and connections.loc["PG_SALES", "driver_properties"] == '{"ssl": "true"}', connections.to_string())
 
 
 # --- DSS's own location comes first, the settings follow -------------------------------------
@@ -158,11 +158,36 @@ for link in links.itertuples(index=False):
     recipe_types[link.recipe_name] = link.recipe_type
 check("recipe type read from the recipe settings", recipe_types == {"compute_clean": "python", "join": "join", "copy": "sync"},
       recipe_types)
-url_connection = connections.loc["ORA_URL"]
-check("connection defined by a JDBC URL: vendor, host, port, service, user from the URL",
-      [url_connection.jdbc_vendor, url_connection.host, str(url_connection.port), url_connection.database_or_service,
-       url_connection.login_user] == ["oracle", "ora", "1521", "FREEPDB1", "sales_dssout"], url_connection.to_string())
-check("the JDBC URL and its password are never copied", "url-secret" not in connections.to_string())
+def connection_values(name, columns):
+    values = []
+    for column in columns:
+        value = connections.loc[name, column]
+        if value is None or (not isinstance(value, str) and pd.isna(value)):
+            values.append(None)
+        else:
+            values.append(str(value))
+    return values
+
+
+check("fields only: mode FIELDS, effective = fields, no JDBC values",
+      connection_values("PG_SALES", ["connection_mode", "effective_host", "effective_port",
+                                     "effective_database_or_service", "jdbc_url", "stale_fields"])
+      == ["FIELDS", "pg", "5432", "appdb", None, "NO"])
+check("useURL ticked over old fields: both kept, effective = the URL values, stale_fields YES",
+      connection_values("ORA_URL", ["connection_mode", "field_host", "field_port", "field_database_or_service",
+                                    "jdbc_vendor", "jdbc_host", "jdbc_port", "jdbc_database_or_service", "jdbc_user",
+                                    "effective_host", "effective_port", "effective_database_or_service",
+                                    "effective_user", "stale_fields"])
+      == ["JDBC", "old-host", "1600", "OLDSVC", "oracle", "ora", "1521", "FREEPDB1", "sales_dssout",
+          "ora", "1521", "FREEPDB1", "sales_dssout", "YES"],
+      connections.loc["ORA_URL"].to_string())
+check("the raw JDBC URL is kept unchanged",
+      connections.loc["ORA_URL", "jdbc_url"] == "jdbc:oracle:thin:sales_dssout/url-secret@//ora:1521/FREEPDB1")
+check("JDBC URL typed into the host field: parsed and used, stale_fields YES, URL parameters without the password",
+      connection_values("PG_HOST_URL", ["connection_mode", "effective_host", "effective_port",
+                                        "effective_database_or_service", "jdbc_properties", "stale_fields"])
+      == ["FIELDS", "pg", "5432", "appdb", '{"ssl": "true"}', "YES"],
+      connections.loc["PG_HOST_URL"].to_string())
 check("dataset on that connection: the URL user as Oracle login user",
       candidates("SALES", "via_url") == [("CANDIDATE", "LOGIN_USER", "SALES_DSSOUT", "LEDGER")], candidates("SALES", "via_url"))
 

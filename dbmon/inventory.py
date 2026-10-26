@@ -367,35 +367,12 @@ def connection_row(name, info):
     if not credential:
         credential = {}
 
-    login_user = first_value(credential, ["user"])
-    if login_user is None:
-        login_user = first_value(params, ["user"])
-
-    properties = {}
+    driver_properties = {}
     for prop in params.get("properties", []):
         prop_name = prop.get("name", "")
         if is_secret(prop_name) or prop.get("secret"):
             continue
-        properties[prop_name] = prop.get("value")
-
-    # Connection defined by a JDBC URL: host, port, database and user come from it.
-    # The URL itself is never kept: it can hold a password.
-    host = first_value(params, ["host"])
-    port = first_value(params, ["port"])
-    database = first_value(params, ["db", "serviceName", "sid"])
-    jdbc_vendor = None
-    url = first_value(params, ["url", "jdbcUrl"])
-    if url is not None and str(url).lower().startswith("jdbc:"):
-        jdbc = parse_jdbc(str(url))
-        jdbc_vendor = jdbc.vendor
-        if host is None:
-            host = jdbc.host
-        if port is None:
-            port = jdbc.port
-        if database is None:
-            database = jdbc.database
-        if login_user is None:
-            login_user = jdbc.user
+        driver_properties[prop_name] = prop.get("value")
 
     post_connect = params.get("postConnectStatementsExpandedAndSplit")
     if not post_connect and params.get("postConnectStatements"):
@@ -405,23 +382,138 @@ def connection_row(name, info):
         "connection": name,
         "connection_type": info.get("type"),
         "credentials_mode": info.get("credentialsMode"),
-        "jdbc_vendor": jdbc_vendor,
-        "host": host,
-        "port": port,
-        "database_or_service": database,
-        "login_user": login_user,
-        "default_schema": first_value(params, ["defaultSchema", "schema"]),
-        "jdbc_properties": None,
-        "post_connect_statements": None,
-        "naming_rule": None,
     }
-    if properties:
-        row["jdbc_properties"] = json.dumps(properties, sort_keys=True)
+    row.update(connection_target(params, credential))
+    row["default_schema"] = first_value(params, ["defaultSchema", "schema"])
+    row["driver_properties"] = None
+    row["post_connect_statements"] = None
+    row["naming_rule"] = None
+    if driver_properties:
+        row["driver_properties"] = json.dumps(driver_properties, sort_keys=True)
     if post_connect:
         row["post_connect_statements"] = json.dumps(post_connect)
     if params.get("namingRule"):
         row["naming_rule"] = json.dumps(params["namingRule"], sort_keys=True)
     return row
+
+
+def connection_target(params, credential):
+    """Where a connection points, from its separate fields and from its JDBC URL, and what
+    DSS really uses.
+
+    connection_mode   JDBC when "useURL" is ticked (DSS then uses the URL), else FIELDS
+    field_*           host, port, database or service, user as typed in the fields
+    jdbc_url          the JDBC URL as configured, unchanged. It can hold a password: the
+                      dataset holding it must be restricted accordingly
+    jdbc_*            the same parsed from the JDBC URL (dbmon.utils.jdbc_parser), its
+                      vendor, and its parameters (jdbc_properties, secrets left out)
+    effective_*       what DSS really uses: the JDBC values in JDBC mode, else the fields.
+                      A JDBC URL typed into the host field is parsed and used too
+    stale_fields      YES when the fields hold values that differ from what DSS uses
+                      (fields left over before "useURL" was ticked, or a URL in the host)
+    """
+    target = {
+        "connection_mode": "FIELDS",
+        "field_host": first_value(params, ["host"]),
+        "field_port": text_or_none(first_value(params, ["port"])),
+        "field_database_or_service": first_value(params, ["db", "serviceName", "sid"]),
+        "field_user": first_value(credential, ["user"]),
+        "jdbc_url": None,
+        "jdbc_vendor": None,
+        "jdbc_host": None,
+        "jdbc_port": None,
+        "jdbc_database_or_service": None,
+        "jdbc_user": None,
+        "jdbc_properties": None,
+        "effective_host": None,
+        "effective_port": None,
+        "effective_database_or_service": None,
+        "effective_user": None,
+        "stale_fields": "NO",
+    }
+    if target["field_user"] is None:
+        target["field_user"] = first_value(params, ["user"])
+    use_url = params.get("useURL")
+    if use_url is True or str(use_url).lower() == "true":
+        target["connection_mode"] = "JDBC"
+
+    # The JDBC URL: in its own parameter, or typed into the host field by mistake
+    url = first_value(params, ["url", "jdbcUrl"])
+    host_is_url = False
+    if target["field_host"] is not None and str(target["field_host"]).lower().startswith("jdbc:"):
+        host_is_url = True
+    if host_is_url:
+        if url is None or target["connection_mode"] == "FIELDS":
+            url = target["field_host"]
+
+    if url is not None and str(url).lower().startswith("jdbc:"):
+        jdbc = parse_jdbc(str(url))
+        target["jdbc_url"] = jdbc.raw
+        target["jdbc_vendor"] = jdbc.vendor
+        target["jdbc_host"] = jdbc.host
+        target["jdbc_port"] = text_or_none(jdbc.port)
+        target["jdbc_database_or_service"] = jdbc.database
+        target["jdbc_user"] = jdbc.user
+        url_parameters = jdbc_url_parameters(jdbc.raw)
+        if url_parameters:
+            target["jdbc_properties"] = json.dumps(url_parameters, sort_keys=True)
+
+    # What DSS really uses: the JDBC values in JDBC mode (or a URL in the host), else the fields
+    use_jdbc = False
+    if target["jdbc_host"] is not None:
+        if target["connection_mode"] == "JDBC" or host_is_url:
+            use_jdbc = True
+    if use_jdbc:
+        target["effective_host"] = target["jdbc_host"]
+        target["effective_port"] = target["jdbc_port"]
+        target["effective_database_or_service"] = target["jdbc_database_or_service"]
+    else:
+        target["effective_host"] = target["field_host"]
+        target["effective_port"] = target["field_port"]
+        target["effective_database_or_service"] = target["field_database_or_service"]
+
+    # In DSS the user and password fields stay separate from the URL: the field user first
+    target["effective_user"] = target["field_user"]
+    if target["effective_user"] is None:
+        target["effective_user"] = target["jdbc_user"]
+
+    # Fields that hold something else than what DSS uses
+    if host_is_url:
+        target["stale_fields"] = "YES"
+    elif use_jdbc:
+        pairs = [("field_host", "jdbc_host"), ("field_port", "jdbc_port"),
+                 ("field_database_or_service", "jdbc_database_or_service")]
+        for field_column, jdbc_column in pairs:
+            field_value = text_or_none(target[field_column])
+            jdbc_value = text_or_none(target[jdbc_column])
+            if field_value is not None and field_value != jdbc_value:
+                target["stale_fields"] = "YES"
+
+    return target
+
+
+def jdbc_url_parameters(url):
+    """Parameters written in a JDBC URL (?a=1&b=2 or ;a=1;b=2), secrets left out."""
+    parameters = {}
+    if url is None:
+        return parameters
+    parts = re.split(r"[?;&]", str(url))
+    for part in parts[1:]:
+        if "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip()
+        if name == "" or is_secret(name):
+            continue
+        parameters[name] = value.strip()
+    return parameters
+
+
+def text_or_none(value):
+    """Value as text, None when empty."""
+    if value is None or value == "":
+        return None
+    return str(value)
 
 
 def is_secret(name):
@@ -544,8 +636,8 @@ def schema_candidates(dataset, connection, engine, role_settings):
         return "CONNECTION_DEFAULT", [connection["default_schema"]], None
 
     properties = {}
-    if connection.get("jdbc_properties"):
-        properties = json.loads(connection["jdbc_properties"])
+    if connection.get("driver_properties"):
+        properties = json.loads(connection["driver_properties"])
     for prop_name in properties:
         if prop_name.lower() == "currentschema" and properties[prop_name]:
             return "JDBC_PROPERTY", split_schemas(properties[prop_name], None), None
@@ -559,7 +651,7 @@ def schema_candidates(dataset, connection, engine, role_settings):
             return "POST_CONNECT", [oracle_match.group(1)], None
         postgres_match = POSTGRES_SEARCH_PATH.search(statement)
         if postgres_match:
-            return "POST_CONNECT", split_schemas(postgres_match.group(1), connection.get("login_user")), None
+            return "POST_CONNECT", split_schemas(postgres_match.group(1), connection.get("effective_user")), None
     note = None
     if statements:
         note = "post-connect statements without a recognised schema setting"
@@ -567,7 +659,7 @@ def schema_candidates(dataset, connection, engine, role_settings):
     if connection.get("credentials_mode") == "PER_USER":
         return "PER_USER", [], "connection logs in as each DSS user"
 
-    login_user = connection.get("login_user")
+    login_user = connection.get("effective_user")
     if not login_user:
         return "UNRESOLVED", [], "no login user on the connection"
 
@@ -575,7 +667,7 @@ def schema_candidates(dataset, connection, engine, role_settings):
         # An unquoted Oracle user name is stored in upper case
         return "LOGIN_USER", [login_user.upper()], note
 
-    search_path = user_search_path(login_user, connection.get("database_or_service"), role_settings)
+    search_path = user_search_path(login_user, connection.get("effective_database_or_service"), role_settings)
     return "SEARCH_PATH", split_schemas(search_path, login_user), note
 
 
