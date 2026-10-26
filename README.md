@@ -30,6 +30,7 @@ dbmon/                    Python package, imported in the DSS project library as
 └── sql/
     ├── oracle/           identity, storage_units, role_settings, objects
     └── postgresql/       the same four files
+tests/                    tests on local Oracle and PostgreSQL containers, see tests/README.md
 recipes/
 ├── collect_storage.py    code of the step 1 recipe
 └── inventory_dss.py      code of the step 2 recipe
@@ -107,6 +108,7 @@ An object that belongs to no table (sequence, cluster, temporary segment of a st
 - Each SQL file runs as-is in SQL*Plus, SQLcl or psql: try a change there first.
 - Both engines return the same columns in the same order, because their rows go to the same dataset. A column that does not exist on one engine is `NULL` there.
 - Oracle files keep SQL*Plus rules: no blank line inside the statement, no `&`.
+- Run [tests/test_collect.py](tests/README.md) afterwards.
 
 ## Step 2: inventory of the DSS datasets
 
