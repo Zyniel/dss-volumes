@@ -13,7 +13,7 @@ import pandas as pd
 # The databases dataset of the tests: admin connections and the DSS connections they hold
 DATABASES = pd.DataFrame([
     ("ADM_PG_APP", "postgresql", "PG app", "PG_SALES,PG_PERUSER, PG_POSTCONNECT"),
-    ("ADM_ORA", "oracle", "ORA", "ORA_SALES"),
+    ("ADM_ORA", "oracle", "ORA", "ORA_SALES,ORA_URL"),
 ], columns=["connection", "engine", "label", "dss_connections"])
 
 
@@ -36,10 +36,9 @@ def metric(metric_id, values_by_partition):
     return {"metric": {"id": metric_id}, "lastValues": last_values}
 
 
-def node(node_type, ref, predecessors=(), successors=(), sub_type=None, project_key=None):
+def node(node_type, ref, predecessors=(), successors=(), project_key=None):
+    # as on DSS: the graph does not say the recipe type, the recipe settings do
     result = {"type": node_type, "ref": ref, "predecessors": list(predecessors), "successors": list(successors)}
-    if sub_type is not None:
-        result["subType"] = sub_type
     if project_key is not None:
         result["projectKey"] = project_key
     return result
@@ -61,7 +60,9 @@ PROJECTS = {
             dataset("query_ds", "PostgreSQL", "PG_SALES", mode="query"),
             dataset("elsewhere", "PostgreSQL", "PG_UNMAPPED", "public", "t"),
             dataset("old_copy", "PostgreSQL", "PG_SALES", "appx", "mv_totals"),
+            dataset("via_url", "Oracle", "ORA_URL", "", "LEDGER"),
         ],
+        "recipes": {"compute_clean": "python"},
         "metrics": {
             "raw_orders": [metric("records:COUNT_RECORDS", {"NP": 3000})],
             "orders_clean": [metric("records:COUNT_RECORDS", {"NP": 0})],
@@ -70,7 +71,7 @@ PROJECTS = {
         "graph": {
             "raw_orders": node("COMPUTABLE_DATASET", "raw_orders", successors=["compute_clean"]),
             "compute_clean": node("RUNNABLE_RECIPE", "compute_clean", ["raw_orders"],
-                                  ["orders_clean", "orders_ora", "folder1"], sub_type="python"),
+                                  ["orders_clean", "orders_ora", "folder1"]),
             "orders_clean": node("COMPUTABLE_DATASET", "orders_clean", ["compute_clean"]),
             "orders_ora": node("COMPUTABLE_DATASET", "orders_ora", ["compute_clean"]),
             "folder1": node("COMPUTABLE_FOLDER", "folder1", ["compute_clean"]),
@@ -85,18 +86,19 @@ PROJECTS = {
             dataset("missing", "PostgreSQL", "PG_SALES", "appx", "nope"),
             dataset("dup_writer", "PostgreSQL", "PG_SALES", "sales_dssout", "SALES_orders", managed=True),
         ],
+        "recipes": {"join": "join", "copy": "sync"},
         "metrics": {"fin_summary": [metric("basic:SIZE", {"NP": 2097152})]},
         "graph": {
             "SALES.orders_clean": node("COMPUTABLE_DATASET", "SALES.orders_clean", successors=["join"],
                                        project_key="SALES"),
-            "join": node("RUNNABLE_RECIPE", "join", ["SALES.orders_clean"], ["fin_summary"], sub_type="join"),
+            "join": node("RUNNABLE_RECIPE", "join", ["SALES.orders_clean"], ["fin_summary"]),
             "fin_summary": node("COMPUTABLE_DATASET", "fin_summary", ["join"], ["copy"]),
-            "copy": node("RUNNABLE_RECIPE", "copy", ["fin_summary"], ["dup_writer"], sub_type="sync"),
+            "copy": node("RUNNABLE_RECIPE", "copy", ["fin_summary"], ["dup_writer"]),
             "dup_writer": node("COMPUTABLE_DATASET", "dup_writer", ["copy"]),
         },
     },
     "BROKEN": {"tags": [], "variables": {"standard": {}, "local": {}}, "exposed": {"objects": []},
-               "datasets": [], "metrics": {}, "graph": None},
+               "datasets": [], "recipes": {}, "metrics": {}, "graph": None},
 }
 
 CONNECTIONS = {
@@ -114,6 +116,9 @@ CONNECTIONS = {
                     "resolvedParams": {"host": "x", "db": "x", "user": "u"}},
     "ORA_SALES": {"type": "Oracle", "credentialsMode": "GLOBAL",
                   "resolvedParams": {"host": "ora", "port": 1521, "db": "FREEPDB1", "user": "sales_dsswork"}},
+    # defined by a JDBC URL only, with a password inside: never copied
+    "ORA_URL": {"type": "Oracle", "credentialsMode": "GLOBAL",
+                "resolvedParams": {"useURL": True, "url": "jdbc:oracle:thin:sales_dssout/url-secret@//ora:1521/FREEPDB1"}},
     "filesystem_managed": {"type": "Filesystem", "resolvedParams": {"root": "/data/managed"}},
 }
 
@@ -150,6 +155,12 @@ class FakeProject(object):
             raise Exception("flow graph not readable")
         graph = Handle(data={"nodes": self.definition["graph"]})
         return Handle(get_graph=lambda: graph)
+
+    def get_recipe(self, recipe_name):
+        # DSSRecipe.get_settings().type is the "type" field of the recipe's JSON definition
+        recipe_type = self.definition["recipes"][recipe_name]
+        settings = Handle(type=recipe_type, recipe_settings={"type": recipe_type})
+        return Handle(get_settings=lambda: settings)
 
     def get_dataset(self, dataset_name):
         raw = {"metrics": self.definition["metrics"].get(dataset_name, [])}

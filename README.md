@@ -27,6 +27,7 @@ dbmon/                    Python package, imported in the DSS project library as
 ├── collect.py            runs the SQL files through each admin connection, sums objects per table
 ├── inventory.py          DSS datasets, flow roles, storage locations (step 2)
 ├── schemas.py            schema of every output dataset
+├── utils/jdbc_parser.py  STUB of the jdbc_parser library: replace it by the real one (same interface)
 ├── use_case.py           use case of a DSS project
 └── sql/
     ├── oracle/           identity, storage_units, role_settings, objects
@@ -130,8 +131,8 @@ An object that belongs to no table (sequence, cluster, temporary segment of a st
 | `dss_projects` | project | `project_name`, `project_tags`, `use_case`, `use_case_source` (`TAG`, `RULE` or `NONE`, see [use case](#use-case-of-a-project)) |
 | `dss_datasets` | dataset | type, `managed`, partitioning, `connection`, `mode`, `schema`, `table`, `catalog`, `path`; the same with `${...}` replaced (`resolved_*`: instance, then project standard, then project local variables, and `projectKey`); `shared`, `n_shared_with` (the projects themselves: `dss_dataset_shares`); `metric_rows`, `metric_size` (MB) and `is_populated` (`YES`, `NO`, `UNKNOWN`) from the metrics DSS last computed (never computed by dbmon) |
 | `dss_dataset_shares` | shared dataset and project it is exposed to | `project_key`, `dataset_name`, `target_project` |
-| `dss_flow_links` | recipe input or output | `project_key`, `recipe_name`, `recipe_type`, `direction`, `dataset_project`, `dataset_name`, `foreign` (dataset of another project). From each project's flow graph; managed folders and models are left out |
-| `dss_connections` | connection | `connection_type`, `credentials_mode`, `host`, `port`, `database_or_service`, `login_user`, `default_schema`, `jdbc_properties`, `post_connect_statements`, `naming_rule`. No password or other secret |
+| `dss_flow_links` | recipe input or output | `project_key`, `recipe_name`, `recipe_type` (from the recipe settings: `get_recipe(name).get_settings().type`), `direction`, `dataset_project`, `dataset_name`, `foreign` (dataset of another project). From each project's flow graph; managed folders and models are left out |
+| `dss_connections` | connection | `connection_type`, `credentials_mode`, `jdbc_vendor`, `host`, `port`, `database_or_service`, `login_user`, `default_schema`, `jdbc_properties`, `post_connect_statements`, `naming_rule`. A connection defined by a JDBC URL gets them from the URL (`dbmon.utils.jdbc_parser.parse_jdbc`); the URL itself is never kept. No password or other secret |
 | `dss_dataset_locations` | dataset and candidate schema | `candidate_rank` (best first), `candidate_status`, `database_label`, `schema_name`, `table_name`, `schema_source`, `note` |
 
 ### Candidate locations

@@ -170,6 +170,7 @@ SCHEMAS = {
         ("connection", "string"),
         ("connection_type", "string"),
         ("credentials_mode", "string"),
+        ("jdbc_vendor", "string"),
         ("host", "string"),
         ("port", "string"),
         ("database_or_service", "string"),

@@ -133,6 +133,7 @@ def found(key):
 check("search_path candidate found", found(("SALES", "raw_orders")) == ("FOUND", "sales_dsswork", "SALES_orders"))
 check("post-connect candidate found", found(("SALES", "orders_clean")) == ("FOUND", "sales_dssout", "SALES_orders"))
 check("Oracle login user found", found(("SALES", "orders_ora")) == ("FOUND", "SALES_DSSWORK", "ORDERS"))
+check("user of a JDBC URL connection found", found(("SALES", "via_url")) == ("FOUND", "SALES_DSSOUT", "LEDGER"))
 check("found ignoring case, names as in the database", found(("SALES", "case_test")) == ("FOUND", "fin_dssout", "ledger"))
 check("missing table: NOT_FOUND", found(("FIN", "missing"))[0] == "NOT_FOUND")
 statuses = dataset_tables.match_status.to_dict()
@@ -182,11 +183,14 @@ sales_read = (owned.loc[("PG app", "sales_dsswork", "SALES_orders"), "total_mb"]
               + owned.loc[("PG app", "fin_dssout", "ledger"), "total_mb"])
 check("read_mb = tables SALES points to without owning them, not added to owned",
       abs(consumption.loc["SALES", "read_mb"] - sales_read) < 0.01, (consumption.loc["SALES", "read_mb"], sales_read))
-check("no_flow_mb = tables only its out-of-pipeline datasets point to",
-      abs(consumption.loc["SALES", "no_flow_mb"] - owned.loc[("PG app", "appx", "mv_totals"), "total_mb"]) < 0.01)
+sales_no_flow = (owned.loc[("PG app", "appx", "mv_totals"), "total_mb"]
+                 + owned.loc[("ORA", "SALES_DSSOUT", "LEDGER"), "total_mb"])
+check("no_flow_mb = tables only its out-of-pipeline datasets point to (old_copy, via_url)",
+      abs(consumption.loc["SALES", "no_flow_mb"] - sales_no_flow) < 0.01
+      and owned.loc[("ORA", "SALES_DSSOUT", "LEDGER"), "status"] == "NO_FLOW")
 check("datasets by role and match",
       consumption.loc["SALES", ["n_datasets", "n_target_datasets", "n_source_datasets", "n_orphan_datasets"]].tolist()
-      == [9, 2, 1, 6] and consumption.loc["FIN", "n_datasets_not_found"] == 1)
+      == [10, 2, 1, 7] and consumption.loc["FIN", "n_datasets_not_found"] == 1)
 
 total_owned = consumption.owned_mb.sum()
 not_owned = ownership[ownership.status != "OWNED"].total_mb.sum()

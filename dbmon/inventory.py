@@ -34,6 +34,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 
 from dbmon import use_case
+from dbmon.utils.jdbc_parser import parse_jdbc
 
 # DSS dataset types read as SQL tables, and their engine
 SQL_DATASET_TYPES = {
@@ -246,7 +247,7 @@ def read_flow_links(project_handle, project_key):
             continue
 
         recipe_name = node.get("ref", node_id)
-        recipe_type = node.get("subType")
+        recipe_type = read_recipe_type(project_handle, recipe_name)
 
         for direction, neighbour_ids in (("input", node["predecessors"]), ("output", node["successors"])):
             for neighbour_id in neighbour_ids:
@@ -264,6 +265,17 @@ def read_flow_links(project_handle, project_key):
                     "foreign": yes_no(dataset_project != project_key),
                 })
     return links
+
+
+def read_recipe_type(project_handle, recipe_name):
+    """Type of a recipe (sync, python, join...), from its settings: the "type" field of the
+    recipe's JSON definition. None when the settings cannot be read."""
+    try:
+        settings = project_handle.get_recipe(recipe_name).get_settings()
+    except Exception as error:
+        print("recipe %s: settings not readable: %s" % (recipe_name, error))
+        return None
+    return settings.type
 
 
 def dataset_reference(node, node_id, project_key):
@@ -366,6 +378,25 @@ def connection_row(name, info):
             continue
         properties[prop_name] = prop.get("value")
 
+    # Connection defined by a JDBC URL: host, port, database and user come from it.
+    # The URL itself is never kept: it can hold a password.
+    host = first_value(params, ["host"])
+    port = first_value(params, ["port"])
+    database = first_value(params, ["db", "serviceName", "sid"])
+    jdbc_vendor = None
+    url = first_value(params, ["url", "jdbcUrl"])
+    if url is not None and str(url).lower().startswith("jdbc:"):
+        jdbc = parse_jdbc(str(url))
+        jdbc_vendor = jdbc.vendor
+        if host is None:
+            host = jdbc.host
+        if port is None:
+            port = jdbc.port
+        if database is None:
+            database = jdbc.database
+        if login_user is None:
+            login_user = jdbc.user
+
     post_connect = params.get("postConnectStatementsExpandedAndSplit")
     if not post_connect and params.get("postConnectStatements"):
         post_connect = [params["postConnectStatements"]]
@@ -374,9 +405,10 @@ def connection_row(name, info):
         "connection": name,
         "connection_type": info.get("type"),
         "credentials_mode": info.get("credentialsMode"),
-        "host": params.get("host"),
-        "port": params.get("port"),
-        "database_or_service": first_value(params, ["db", "serviceName", "sid"]),
+        "jdbc_vendor": jdbc_vendor,
+        "host": host,
+        "port": port,
+        "database_or_service": database,
         "login_user": login_user,
         "default_schema": first_value(params, ["defaultSchema", "schema"]),
         "jdbc_properties": None,

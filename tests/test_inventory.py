@@ -151,4 +151,26 @@ for column in declared:
         lengths_ok = False
 check("every string column has a declared maxLength", lengths_ok)
 
+
+# --- recipe types and JDBC URLs ----------------------------------------------------------------
+recipe_types = {}
+for link in links.itertuples(index=False):
+    recipe_types[link.recipe_name] = link.recipe_type
+check("recipe type read from the recipe settings", recipe_types == {"compute_clean": "python", "join": "join", "copy": "sync"},
+      recipe_types)
+url_connection = connections.loc["ORA_URL"]
+check("connection defined by a JDBC URL: vendor, host, port, service, user from the URL",
+      [url_connection.jdbc_vendor, url_connection.host, str(url_connection.port), url_connection.database_or_service,
+       url_connection.login_user] == ["oracle", "ora", "1521", "FREEPDB1", "sales_dssout"], url_connection.to_string())
+check("the JDBC URL and its password are never copied", "url-secret" not in connections.to_string())
+check("dataset on that connection: the URL user as Oracle login user",
+      candidates("SALES", "via_url") == [("CANDIDATE", "LOGIN_USER", "SALES_DSSOUT", "LEDGER")], candidates("SALES", "via_url"))
+
+from dbmon.utils.jdbc_parser import parse_jdbc  # noqa: E402
+parsed = parse_jdbc("jdbc:postgresql://pg.example:5432/appdb?user=dbmon&ssl=true")
+check("parser stub: PostgreSQL URL", [parsed.vendor, parsed.host, parsed.port, parsed.database, parsed.user]
+      == ["postgresql", "pg.example", "5432", "appdb", "dbmon"])
+parsed = parse_jdbc("jdbc:oracle:thin:@dbhost:1521:ORCL")
+check("parser stub: Oracle SID URL", [parsed.vendor, parsed.host, parsed.port, parsed.database] == ["oracle", "dbhost", "1521", "ORCL"])
+
 finish()
