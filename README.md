@@ -7,8 +7,8 @@ Earlier work is kept as reference only in [archive/](archive/README.md).
 ## Flow
 
 ```
-databases (editable) ─► 1 Collect     (SQL per engine)  ─► storage_units, objects, tables, collect_log
-DSS API              ─► 2 Inventory   (DSS API)         ─► dss_projects, dss_datasets, dss_connections
+databases (editable) ─► 1 Collect     (SQL per engine)  ─► storage_units, role_settings, objects, tables, collect_log
+DSS API              ─► 2 Inventory   (DSS API)         ─► dss_datasets, dss_flow_links, dss_connections, inventory_log
                         3 Reconcile   (visual recipes)  ─► tables and objects with use case, project, status
                         4 Aggregate   (Group recipes)   ─► by database, storage unit, use case, project
 ```
@@ -16,7 +16,7 @@ DSS API              ─► 2 Inventory   (DSS API)         ─► dss_projects,
 | Step | State |
 |---|---|
 | 1 Collect | done |
-| 2 Inventory | to do |
+| 2 Inventory | written, tested with a stand-in DSS client: to check on a real DSS 13.2 / 15.2 |
 | 3 Reconcile | to do |
 | 4 Aggregate | to do |
 
@@ -25,12 +25,14 @@ DSS API              ─► 2 Inventory   (DSS API)         ─► dss_projects,
 ```
 dbmon/                    Python package, imported in the DSS project library as python/dbmon
 ├── collect.py            runs the SQL files through each admin connection, sums objects per table
+├── inventory.py          DSS datasets, flow roles, storage locations (step 2)
 ├── use_case.py           use case of a DSS project
 └── sql/
-    ├── oracle/           identity, storage_units, objects
-    └── postgresql/       the same three files
+    ├── oracle/           identity, storage_units, role_settings, objects
+    └── postgresql/       the same four files
 recipes/
-└── collect_storage.py    code of the step 1 recipe
+├── collect_storage.py    code of the step 1 recipe
+└── inventory_dss.py      code of the step 2 recipe
 ```
 
 ## Step 1: collect
@@ -51,10 +53,10 @@ recipes/
    | `environment` | optional. `PROD`, `DEV`..., copied on every row |
    | `objects` | optional. `N`: only the tablespaces of that database, no objects nor tables. Empty: `Y` |
 
-4. Create a Python recipe with `databases` as input and `storage_units`, `objects`, `tables` and `collect_log` as outputs. Paste [recipes/collect_storage.py](recipes/collect_storage.py).
-5. Partition the four outputs by day: time dimension `snapshot_day`, period Day. On a SQL connection, partition on the column `snapshot_day`. Running the recipe again the same day replaces that day, and old days can be dropped by partition. The recipe refuses to build any partition but today's: the databases can only be read as they are now.
+4. Create a Python recipe with `databases` as input and `storage_units`, `role_settings`, `objects`, `tables` and `collect_log` as outputs. Paste [recipes/collect_storage.py](recipes/collect_storage.py).
+5. Partition the five outputs by day: time dimension `snapshot_day`, period Day. On a SQL connection, partition on the column `snapshot_day`. Running the recipe again the same day replaces that day, and old days can be dropped by partition. The recipe refuses to build any partition but today's: the databases can only be read as they are now.
 6. Create the scenario:
-   - Step "Build": the four outputs, partition `CURRENT_DAY`.
+   - Step "Build": the five outputs, partition `CURRENT_DAY`.
    - Step "Verify rules or run checks": `collect_log`, partition `CURRENT_DAY`. In its Data Quality tab, add the rule "Column values in set" on `status` with the single value `OK`: a database that failed makes this step fail.
    - Trigger: daily, out of business hours. Reporter: a mail when the scenario does not end in success.
 
@@ -106,10 +108,71 @@ An object that belongs to no table (sequence, cluster, temporary segment of a st
 - Both engines return the same columns in the same order, because their rows go to the same dataset. A column that does not exist on one engine is `NULL` there.
 - Oracle files keep SQL*Plus rules: no blank line inside the statement, no `&`.
 
+## Step 2: inventory of the DSS datasets
+
+[dbmon/inventory.py](dbmon/inventory.py) reads every project through the DSS public API: the datasets involved in recipes, where they are stored, whether they are shared, and whether DSS sees them populated. Notebooks are not read: a dataset only used by a notebook is `orphan`.
+
+### Set up
+
+1. In `databases`, add the optional column `dss_connections`: the DSS connections that point to that database, comma separated. That is how a dataset is tied to a monitored database.
+2. Create a Python recipe with `databases`, `tables` and `role_settings` as inputs, and `dss_datasets`, `dss_flow_links`, `dss_connections` and `inventory_log` as outputs. Paste [recipes/inventory_dss.py](recipes/inventory_dss.py). Partition the outputs by day like step 1; it uses the latest day of `tables` and `role_settings`.
+3. Run it in the same scenario, after step 1, as a user with an admin API key ("Run as" in the scenario settings): connections and instance variables need admin rights.
+
+### dss_datasets
+
+| Column | Meaning | Source |
+|---|---|---|
+| `project_key`, `project_tags`, `use_case` | project, its tags, its use case | project list, `dbmon.use_case` |
+| `dataset_name`, `dataset_type`, `managed`, `mode` | the dataset | dataset settings |
+| `partitioned`, `partition_dimensions` | partitioning | dataset settings |
+| `connection`, `schema`, `table`, `catalog`, `path` | storage as configured | dataset settings, `params` |
+| `resolved_schema`, `resolved_table`, `resolved_path` | storage with `${...}` replaced (instance, then project standard, then project local variables, and `projectKey`), the schema resolved as below | settings, variables, DSS location when readable |
+| `flow_role` | `target`: output of a recipe. `source`: input of a recipe, output of none. `orphan`: neither | `dss_flow_links` |
+| `n_producers`, `n_consumers` | recipes writing it, recipes reading it (other projects included) | `dss_flow_links` |
+| `shared`, `shared_with` | exposed to other projects, and which | project settings, exposed objects |
+| `used_by_projects` | other projects whose recipes read it | `dss_flow_links` |
+| `metric_rows` | record count last computed by DSS | metric `records:COUNT_RECORDS` |
+| `metric_size` | size in MB last computed by DSS (mostly file-based datasets) | metric `basic:SIZE` |
+| `is_populated` | `YES`, `NO`, or `UNKNOWN` when DSS never computed the metrics | metrics |
+| `database_label` | monitored database of its connection | `databases` |
+| `schema_source`, `schema_candidates` | where the schema comes from, the schemas tried in order | see below |
+| `location_status` | `FOUND`, `NOT_FOUND`, `AMBIGUOUS`, `UNRESOLVED`, `UNMAPPED` (connection not in `databases`), `NO_TABLE` (SQL query dataset), `NOT_SQL` | step 1 `tables` |
+| `location_note` | why, when not found | |
+
+Metrics are only read, never computed. For a partitioned dataset the whole-dataset value is used, or the sum of the partitions when DSS has no whole-dataset value.
+
+### Where a SQL dataset points to
+
+When the dataset has no schema, the database decides. The first source that gives a value wins:
+
+| `schema_source` | |
+|---|---|
+| `DSS_LOCATION` | the location DSS resolves itself (`get_location_info`), when the recipe can read it |
+| `DATASET` | the dataset's schema setting |
+| `CONNECTION_DEFAULT` | the connection's default schema |
+| `JDBC_PROPERTY` | the JDBC property `currentSchema` (PostgreSQL) |
+| `POST_CONNECT` | `ALTER SESSION SET CURRENT_SCHEMA` or `SET search_path` in the connection's post-connect statements |
+| `PER_USER` | the connection logs in as each DSS user: cannot be told |
+| `LOGIN_USER` | Oracle: the schema of the login user |
+| `SEARCH_PATH` | PostgreSQL: the login user's `search_path` from `role_settings` (role in this database, then the role, then the database), by default `"$user", public` |
+
+The candidate schemas are then looked up in the step 1 `tables`, in order: exact names first, then ignoring case.
+
+### dss_flow_links and dss_connections
+
+- `dss_flow_links`: one row per recipe input or output, from each project's flow graph: `project_key`, `recipe_name`, `recipe_type`, `direction` (input or output), `dataset_project`, `dataset_name`, `foreign` (dataset of another project). Managed folders and models are left out.
+- `dss_connections`: one row per connection: `connection_type`, `credentials_mode`, `host`, `port`, `database_or_service`, `login_user`, `default_schema`, `jdbc_properties`, `post_connect_statements`, `naming_rule`. Passwords and other secrets are never copied.
+
+### To check on a real DSS
+
+- the parameter names of Oracle and PostgreSQL connections (`db`, `defaultSchema`...) in `get_info()`
+- what `get_location_info()` returns for SQL datasets, and whether a recipe may call it on any project's dataset
+- how datasets of other projects appear in the flow graph
+
 ## Use case of a project
 
 `dbmon.use_case.project_use_case(project_key, tags)` is the only place that decides the use case of a DSS project. It reads the `CDP-UseCase` global tag category (`CDP-UseCase:<use case>` in the project's tags), and falls back on the current criteria until every project is tagged.
 
 ## Compatibility
 
-Python 3.9 and later, DSS 13.2 and 15.2. Step 1 only uses `SQLExecutor2.query_to_df` and dataset reads and writes.
+Python 3.9 and later, DSS 13.2 and 15.2. Step 1 only uses `SQLExecutor2.query_to_df` and dataset reads and writes. Step 2 uses the public API (`dataikuapi`), checked against the 13.4.4 sources.

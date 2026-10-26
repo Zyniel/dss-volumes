@@ -7,6 +7,7 @@
 #                           label        optional. Name shown in the reports (default: the connection)
 #                           environment  optional. PROD, DEV...
 # Outputs storage_units   one row per tablespace
+#         role_settings   PostgreSQL search_path settings of roles and databases
 #         objects         one row per object and tablespace
 #         tables          one row per table: its objects summed
 #         collect_log     one row per database: OK or FAILED, error, seconds per query

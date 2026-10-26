@@ -20,10 +20,10 @@ from dataiku import SQLExecutor2
 ENGINES = ("oracle", "postgresql")
 
 # SQL files run for each database, after identity.sql
-QUERIES = ("storage_units", "objects")
+QUERIES = ("storage_units", "role_settings", "objects")
 
 # DataFrames returned for each database
-RESULTS = ("storage_units", "objects", "tables")
+RESULTS = ("storage_units", "role_settings", "objects", "tables")
 
 # Families of objects (column "family" of objects.sql)
 FAMILIES = ("TABLE", "INDEX", "LOB", "OTHER")
@@ -89,8 +89,8 @@ def run_and_time(connection, engine, name, timings):
 # ---------------------------------------------------------------------------------------
 
 def collect(connection, engine, with_objects=True, label=None, environment=None, timings=None):
-    """Read one database. Returns a dict {result name: DataFrame}: storage_units, plus
-    objects and tables when with_objects is True.
+    """Read one database. Returns a dict {result name: DataFrame}: storage_units and
+    role_settings, plus objects and tables when with_objects is True.
 
     connection    DSS connection with the admin account
     engine        oracle or postgresql
@@ -127,6 +127,14 @@ def collect(connection, engine, with_objects=True, label=None, environment=None,
         # PostgreSQL tablespaces belong to the whole cluster, not to one database
         storage_units["database_name"] = None
     results["storage_units"] = storage_units
+
+    # search_path settings of roles and databases (PostgreSQL only, always empty on Oracle)
+    role_settings = run_and_time(connection, engine, "role_settings", timings)
+    add_front_columns(role_settings, front_columns)
+    if engine == "postgresql":
+        # these settings belong to the whole cluster, not to one database
+        role_settings["database_name"] = None
+    results["role_settings"] = role_settings
 
     # Objects, and the tables they belong to
     if with_objects:
@@ -257,6 +265,10 @@ def collect_all(databases, parallel=4):
     # Every database of a PostgreSQL cluster returns the cluster's tablespaces: keep them once
     stacked["storage_units"] = stacked["storage_units"].drop_duplicates(
         subset=["engine", "server_name", "database_name", "tablespace_name"])
+    # Same for the role settings
+    if not stacked["role_settings"].empty:
+        stacked["role_settings"] = stacked["role_settings"].drop_duplicates(
+            subset=["engine", "server_name", "role_name", "setting_database"])
 
     return stacked, log
 

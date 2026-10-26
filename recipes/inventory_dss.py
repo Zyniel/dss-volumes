@@ -1,0 +1,77 @@
+# DSS Python recipe: inventory of the datasets involved in recipes, and where they are stored.
+#
+# Run it as a user with an admin API key (scenario "Run as" an admin), after collect_storage.
+#
+# Inputs  databases       the same dataset as collect_storage. Optional column dss_connections:
+#                         the DSS connections pointing to that database, comma separated
+#         tables          from collect_storage: the latest day is used
+#         role_settings   from collect_storage: the latest day is used
+# Outputs dss_datasets    one row per dataset
+#         dss_flow_links  one row per recipe input or output
+#         dss_connections one row per connection
+#         inventory_log   one row per project: OK or FAILED
+#
+# Every row starts with snapshot_day, the day of the run. Partition the outputs by day on
+# that column, like the outputs of collect_storage.
+import datetime
+
+import dataiku
+
+from dbmon import inventory
+
+# Also ask DSS for the location it resolves itself (dataiku.Dataset.get_location_info).
+# False: resolve from the dataset and connection settings only.
+USE_DSS_LOCATION = True
+
+
+def latest_day(rows):
+    """Rows of the most recent snapshot_day only."""
+    if rows.empty or "snapshot_day" not in rows.columns:
+        return rows
+    last_day = rows["snapshot_day"].max()
+    return rows[rows["snapshot_day"] == last_day]
+
+
+def read_location(project_key, dataset_name):
+    dataset = dataiku.Dataset(project_key + "." + dataset_name)
+    return dataset.get_location_info()
+
+
+# ---------------------------------------------------------------------------------------
+# Day of this run
+# ---------------------------------------------------------------------------------------
+now_utc = datetime.datetime.now(datetime.timezone.utc)
+day = now_utc.astimezone().date().isoformat()
+if hasattr(dataiku, "dku_flow_variables"):
+    day = dataiku.dku_flow_variables.get("DKU_DST_snapshot_day", day)
+
+# ---------------------------------------------------------------------------------------
+# Read
+# ---------------------------------------------------------------------------------------
+databases = dataiku.Dataset("databases").get_dataframe()
+tables = latest_day(dataiku.Dataset("tables").get_dataframe())
+role_settings = latest_day(dataiku.Dataset("role_settings").get_dataframe())
+
+location_reader = None
+if USE_DSS_LOCATION:
+    location_reader = read_location
+
+client = dataiku.api_client()
+results = inventory.collect_inventory(client, databases, tables, role_settings, location_reader)
+
+# ---------------------------------------------------------------------------------------
+# Write, every row starting with the day of the run
+# ---------------------------------------------------------------------------------------
+for name in results:
+    rows = results[name]
+    if rows.empty:
+        print("%s: no rows in this run, dataset left as it is" % name)
+        continue
+    rows.insert(0, "snapshot_day", day)
+    dataiku.Dataset(name).write_with_schema(rows)
+
+log = results["inventory_log"]
+failed = log[log["status"] == "FAILED"]
+print("%d of %d projects read" % (len(log) - len(failed), len(log)))
+for index, failure in failed.iterrows():
+    print("FAILED %s: %s" % (failure["project_key"], failure["error"]))
