@@ -15,7 +15,7 @@ import pandas as pd
 from harness import REPO, check, finish, install_fake_dataiku
 sys.path.insert(0, REPO)
 from dbmon import schemas  # noqa: E402
-from fake_dss import DATABASES, FakeClient
+from fake_dss import CONNECTION_MAPPING, DATABASES, FakeClient
 
 WRITTEN = {}
 SCHEMAS_WRITTEN = {}
@@ -127,6 +127,7 @@ except ValueError as error:
 
 # --- inventory_dss ---------------------------------------------------------------------------
 INPUTS["databases"] = DATABASES
+INPUTS["audit_connection_mapping"] = CONNECTION_MAPPING
 INPUTS["role_settings"] = pg_run_settings
 printed = run_recipe("inventory_dss.py", {"DKU_DST_snapshot_day": today})
 INVENTORY_OUTPUTS = ["dss_connections", "dss_dataset_locations", "dss_dataset_shares", "dss_datasets", "dss_flow_links",

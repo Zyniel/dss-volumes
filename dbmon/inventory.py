@@ -56,23 +56,27 @@ LINK_COLUMNS = ["project_key", "recipe_name", "recipe_type", "direction",
                 "dataset_project", "dataset_name", "foreign"]
 SHARE_COLUMNS = ["project_key", "dataset_name", "target_project"]
 LOCATION_COLUMNS = ["project_key", "dataset_name", "candidate_rank", "candidate_status",
-                    "database_label", "schema_name", "table_name", "schema_source", "note"]
+                    "connection_name", "audit_connection_name", "database_label",
+                    "schema_name", "table_name", "schema_source", "note"]
 
 
 # ---------------------------------------------------------------------------------------
 # All projects
 # ---------------------------------------------------------------------------------------
 
-def collect_inventory(client, databases, role_settings, read_location=None, parallel=4):
+def collect_inventory(client, databases, role_settings, read_location=None, parallel=4, connection_mapping=None):
     """Read every project of the DSS instance.
 
     client         dataikuapi client with an admin API key (dataiku.api_client() in DSS)
-    databases      the databases dataset: maps DSS connections to the monitored databases
+    databases      the databases dataset: the admin connections and their labels
     role_settings  the role settings collected in step 1 (one snapshot)
     read_location  optional function (project_key, dataset_name) -> location info dict,
                    DSS's own resolved location (dataiku.Dataset.get_location_info). None:
                    candidates from the settings only
     parallel       projects read at the same time. 1: one after the other
+    connection_mapping  the audit_connection_mapping dataset: columns dss_connection (a
+                   connection used by datasets) and audit_connection (the admin connection of
+                   databases that exports its tables). None: admin connections only
 
     Returns {result name: DataFrame}. The rows keep the order of the project list.
     """
@@ -107,7 +111,7 @@ def collect_inventory(client, databases, role_settings, read_location=None, para
         dss_locations.update(outcome["dss_locations"])
 
     connections = read_connections(client)
-    locations = dataset_locations(datasets, connections, databases, role_settings, dss_locations)
+    locations = dataset_locations(datasets, connections, databases, connection_mapping, role_settings, dss_locations)
 
     return {
         "dss_projects": pd.DataFrame(projects),
@@ -528,12 +532,20 @@ def is_secret(name):
 # Candidate locations of the datasets
 # ---------------------------------------------------------------------------------------
 
-def dataset_locations(datasets, connections, databases, role_settings, dss_locations):
+def dataset_locations(datasets, connections, databases, connection_mapping, role_settings, dss_locations):
     """Rows of dss_dataset_locations for every dataset (list of dicts).
+
+    connection_name        the dataset's own connection (the real one)
+    audit_connection_name  the admin connection whose step 1 export holds its tables, from
+                           audit_connection_mapping. An admin connection of databases used by
+                           a dataset is its own audit connection. Empty when unmapped
+    database_label         the label of that admin connection in databases
+    A connection mapped to several admin connections gives its candidates once per admin
+    connection.
 
     candidate_status
       CANDIDATE   a candidate schema and table, to look up in the step 1 tables
-      UNMAPPED    candidates exist, but the connection is not listed in databases
+      UNMAPPED    candidates exist, but the connection leads to no database
       PER_USER    the connection logs in as each DSS user: no candidate
       UNRESOLVED  a variable could not be replaced, or no login user: no candidate
       NO_TABLE    SQL query dataset: no table
@@ -543,25 +555,31 @@ def dataset_locations(datasets, connections, databases, role_settings, dss_locat
     if not connections.empty:
         for row in connections.to_dict("records"):
             connection_by_name[row["connection"]] = without_missing(row)
-    label_by_connection = database_labels(databases)
+    audits_by_connection = audit_connections(databases, connection_mapping)
 
     rows = []
     for dataset in datasets:
         key = (dataset["project_key"], dataset["dataset_name"])
         connection = connection_by_name.get(dataset.get("connection"), {})
-        label = label_by_connection.get(dataset.get("connection"))
+        audits = audits_by_connection.get(dataset.get("connection"), [])
         dss_location = dss_locations.get(key)
-        rows.extend(locations_of(dataset, connection, label, role_settings, dss_location))
+        if not audits:
+            rows.extend(locations_of(dataset, connection, None, None, role_settings, dss_location))
+            continue
+        for audit_connection, label in audits:
+            rows.extend(locations_of(dataset, connection, audit_connection, label, role_settings, dss_location))
     return rows
 
 
-def locations_of(dataset, connection, label, role_settings, dss_location):
-    """Candidate rows of one dataset."""
+def locations_of(dataset, connection, audit_connection, label, role_settings, dss_location):
+    """Candidate rows of one dataset, for one of its audit connections."""
     base = {
         "project_key": dataset["project_key"],
         "dataset_name": dataset["dataset_name"],
         "candidate_rank": None,
         "candidate_status": None,
+        "connection_name": dataset.get("connection"),
+        "audit_connection_name": audit_connection,
         "database_label": label,
         "schema_name": None,
         "table_name": dataset.get("resolved_table"),
@@ -599,7 +617,7 @@ def locations_of(dataset, connection, label, role_settings, dss_location):
     status = "CANDIDATE"
     if label is None:
         status = "UNMAPPED"
-        note = "connection not listed in the databases dataset"
+        note = "connection not in audit_connection_mapping, nor an admin connection of databases"
 
     rows = []
     rank = 0
@@ -701,23 +719,43 @@ def split_schemas(search_path, login_user):
     return schemas
 
 
-def database_labels(databases):
-    """{DSS connection: database label}. Each row of databases maps its admin connection,
-    and the connections listed in its optional column dss_connections (comma separated)."""
-    labels = {}
+def audit_connections(databases, connection_mapping):
+    """{DSS connection: [(audit connection, database label)]}.
+
+    An admin connection of databases is its own audit connection, with the label of its row
+    (the connection name when the label is empty). A connection of audit_connection_mapping
+    leads to the admin connections it is mapped to.
+    """
+    label_of_admin = {}
     for row in databases.to_dict("records"):
         row = without_missing(row)
         label = row.get("label")
         if label is None or str(label).strip() == "":
             label = row["connection"]
-        labels[row["connection"]] = label
-        listed = row.get("dss_connections")
-        if listed is None:
+        label_of_admin[row["connection"]] = label
+
+    audits = {}
+    for admin_connection in label_of_admin:
+        audits[admin_connection] = [(admin_connection, label_of_admin[admin_connection])]
+
+    if connection_mapping is None or connection_mapping.empty:
+        return audits
+    for row in connection_mapping.to_dict("records"):
+        row = without_missing(row)
+        connection = row.get("dss_connection")
+        admin_connection = row.get("audit_connection")
+        if connection is None or admin_connection is None:
             continue
-        for name in str(listed).split(","):
-            if name.strip():
-                labels[name.strip()] = label
-    return labels
+        admin_connection = str(admin_connection).strip()
+        label = label_of_admin.get(admin_connection)
+        if label is None:
+            continue  # mapped to a connection that databases does not list
+        connection = str(connection).strip()
+        if connection not in audits:
+            audits[connection] = []
+        if (admin_connection, label) not in audits[connection]:
+            audits[connection].append((admin_connection, label))
+    return audits
 
 
 # ---------------------------------------------------------------------------------------

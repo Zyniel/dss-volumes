@@ -119,8 +119,8 @@ An object that belongs to no table (sequence, cluster, temporary segment of a st
 
 ### Set up
 
-1. In `databases`, add the optional column `dss_connections`: the DSS connections that point to that database, comma separated. That is how a dataset is tied to a monitored database.
-2. Create a Python recipe with `databases` and `role_settings` as inputs, and `dss_projects`, `dss_datasets`, `dss_dataset_shares`, `dss_flow_links`, `dss_connections`, `dss_dataset_locations` and `inventory_log` as outputs. Paste [recipes/inventory_dss.py](recipes/inventory_dss.py). Partition the outputs by day like step 1; it uses the latest day of `role_settings`.
+1. Create the dataset `audit_connection_mapping`, one row per DSS connection used by datasets: `dss_connection` (that connection) and `audit_connection` (the admin connection of `databases` whose step 1 export holds its tables). That is how a dataset is tied to a monitored database: its connection leads to the admin connection, and that one to its `label` in `databases`. Admin connections used directly by datasets need no row. A connection mapped to several admin connections gets its candidates once per database.
+2. Create a Python recipe with `databases`, `audit_connection_mapping` and `role_settings` as inputs, and `dss_projects`, `dss_datasets`, `dss_dataset_shares`, `dss_flow_links`, `dss_connections`, `dss_dataset_locations` and `inventory_log` as outputs. Paste [recipes/inventory_dss.py](recipes/inventory_dss.py). Partition the outputs by day like step 1; it uses the latest day of `role_settings`.
 3. Run it in the same scenario, after step 1, as a user with an admin API key ("Run as" in the scenario settings): connections and instance variables need admin rights.
 
 ### Datasets
@@ -132,7 +132,7 @@ An object that belongs to no table (sequence, cluster, temporary segment of a st
 | `dss_dataset_shares` | shared dataset and project it is exposed to | `project_key`, `dataset_name`, `target_project` |
 | `dss_flow_links` | recipe input or output | `project_key`, `recipe_name`, `recipe_type` (from the recipe settings: `get_recipe(name).get_settings().type`), `direction`, `dataset_project`, `dataset_name`, `foreign` (dataset of another project). From each project's flow graph; managed folders and models are left out |
 | `dss_connections` | connection | `connection_type`, `credentials_mode`, `connection_mode` (`JDBC` when "useURL" is ticked, else `FIELDS`); `field_host`, `field_port`, `field_database_or_service`, `field_user` as typed in the fields; `jdbc_url` as configured, and `jdbc_vendor`, `jdbc_host`, `jdbc_port`, `jdbc_database_or_service`, `jdbc_user`, `jdbc_properties` (URL parameters, secrets left out) parsed by `dbmon.utils.jdbc_parser.parse_jdbc` (a library of the environment, next to `dbmon` in the project library); `effective_host`, `effective_port`, `effective_database_or_service`, `effective_user`: what DSS really uses (the URL in JDBC mode, or a URL typed into the host field, else the fields); `stale_fields` YES when the fields differ from what DSS uses; `default_schema`, `driver_properties`, `post_connect_statements`, `naming_rule`. `jdbc_url` can hold a password: restrict this dataset accordingly. No other secret is copied |
-| `dss_dataset_locations` | dataset and candidate schema | `candidate_rank` (best first), `candidate_status`, `database_label`, `schema_name`, `table_name`, `schema_source`, `note` |
+| `dss_dataset_locations` | dataset, audit connection and candidate schema | `candidate_rank` (best first), `candidate_status`, `connection_name` (the dataset's real connection), `audit_connection_name` (the admin connection from `audit_connection_mapping`, empty when unmapped), `database_label`, `schema_name`, `table_name`, `schema_source`, `note` |
 
 ### Candidate locations
 
@@ -148,7 +148,7 @@ When a SQL dataset has no schema, the database decides. The candidates, best fir
 | `LOGIN_USER` | Oracle: the schema of the login user |
 | `SEARCH_PATH` | PostgreSQL: the login user's `search_path` from `role_settings` (role in this database, then the role, then the database), by default `"$user", public`: one candidate per schema |
 
-`candidate_status`: `CANDIDATE` (to look up in step 1), `UNMAPPED` (connection not in `databases`), and, with a single row and no candidate, `PER_USER` (the connection logs in as each DSS user), `UNRESOLVED`, `NO_TABLE` (SQL query dataset), `NOT_SQL`.
+`candidate_status`: `CANDIDATE` (to look up in step 1), `UNMAPPED` (the connection leads to no database: not in `audit_connection_mapping`, nor an admin connection of `databases`), and, with a single row and no candidate, `PER_USER` (the connection logs in as each DSS user), `UNRESOLVED`, `NO_TABLE` (SQL query dataset), `NOT_SQL`.
 
 ## Step 3: project and dataset analysis (Oracle SQL)
 

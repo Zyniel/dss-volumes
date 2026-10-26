@@ -15,7 +15,7 @@ sys.dont_write_bytecode = True
 import pandas as pd
 
 from harness import REPO, check, finish, install_fake_dataiku, sqlplus
-from fake_dss import DATABASES, FakeClient
+from fake_dss import CONNECTION_MAPPING, DATABASES, FakeClient
 
 install_fake_dataiku()
 from dbmon import collect, inventory, schemas  # noqa: E402
@@ -90,7 +90,8 @@ def read(name):
 # --- steps 1 and 2 ---------------------------------------------------------------------------
 step1, step1_log = collect.collect_all(DATABASES[["connection", "engine", "label"]], parallel=2)
 check("step 1 collected on both engines", (step1_log.status == "OK").all(), step1_log.to_string())
-step2 = inventory.collect_inventory(FakeClient(), DATABASES, step1["role_settings"])
+step2 = inventory.collect_inventory(FakeClient(), DATABASES, step1["role_settings"],
+                                    connection_mapping=CONNECTION_MAPPING)
 
 # --- scratch schema with the inputs ----------------------------------------------------------
 sqlplus("ALTER SESSION SET CONTAINER = FREEPDB1;\nDROP USER %s CASCADE;\nEXIT\n" % STORE, logon=SYSDBA)

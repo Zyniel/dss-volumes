@@ -149,6 +149,8 @@ SCHEMAS = {
         ("dataset_name", "string"),
         ("candidate_rank", "bigint"),
         ("candidate_status", "string"),
+        ("connection_name", "string"),
+        ("audit_connection_name", "string"),
         ("database_label", "string"),
         ("schema_name", "string"),
         ("table_name", "string"),

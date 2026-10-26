@@ -9,7 +9,7 @@ sys.dont_write_bytecode = True
 import pandas as pd
 
 from harness import check, finish, install_fake_dataiku
-from fake_dss import DATABASES, FakeClient
+from fake_dss import CONNECTION_MAPPING, DATABASES, FakeClient
 
 install_fake_dataiku()
 from dbmon import collect, inventory  # noqa: E402
@@ -20,7 +20,7 @@ check("step 1 collected on both engines", (step1_log.status == "OK").all(), step
 role_settings = step1["role_settings"]
 
 # --- inventory -----------------------------------------------------------------------------
-results = inventory.collect_inventory(FakeClient(), DATABASES, role_settings)
+results = inventory.collect_inventory(FakeClient(), DATABASES, role_settings, connection_mapping=CONNECTION_MAPPING)
 check("outputs", sorted(results) == ["dss_connections", "dss_dataset_locations", "dss_dataset_shares", "dss_datasets",
                                     "dss_flow_links", "dss_projects", "inventory_log"], sorted(results))
 
@@ -91,7 +91,7 @@ check("file dataset: NOT_SQL", [c[0] for c in candidates("SALES", "notes_file")]
 check("connection missing from databases: UNMAPPED with its candidate",
       candidates("SALES", "elsewhere") == [("UNMAPPED", "DATASET", "public", "t")])
 labels = locations.drop_duplicates(["project_key", "dataset_name"]).set_index(["project_key", "dataset_name"])
-check("database label from dss_connections, spaces ignored",
+check("database label through audit_connection_mapping, spaces ignored",
       labels.loc[("SALES", "orders_clean"), "database_label"] == "PG app"
       and labels.loc[("SALES", "orders_ora"), "database_label"] == "ORA")
 
@@ -110,7 +110,8 @@ def read_location(project_key, dataset_name):
     raise Exception("not an input of this recipe")
 
 
-with_dss = inventory.collect_inventory(FakeClient(), DATABASES, role_settings, read_location)
+with_dss = inventory.collect_inventory(FakeClient(), DATABASES, role_settings, read_location,
+                                       connection_mapping=CONNECTION_MAPPING)
 locations = with_dss["dss_dataset_locations"]
 check("DSS location as rank 1, the settings as fallback candidates",
       candidates("SALES", "raw_orders") == [("CANDIDATE", "DSS_LOCATION", "sales_dssout", "SALES_orders"),
@@ -122,8 +123,10 @@ check("DSS location not readable: noted on the candidates",
 
 
 # --- projects read in parallel give the same outputs as one after the other ------------------
-in_parallel = inventory.collect_inventory(FakeClient(), DATABASES, role_settings, parallel=4)
-one_by_one = inventory.collect_inventory(FakeClient(), DATABASES, role_settings, parallel=1)
+in_parallel = inventory.collect_inventory(FakeClient(), DATABASES, role_settings, parallel=4,
+                                          connection_mapping=CONNECTION_MAPPING)
+one_by_one = inventory.collect_inventory(FakeClient(), DATABASES, role_settings, parallel=1,
+                                         connection_mapping=CONNECTION_MAPPING)
 for name in in_parallel:
     parallel_rows = in_parallel[name]
     sequential_rows = one_by_one[name]
@@ -190,5 +193,33 @@ check("JDBC URL typed into the host field: parsed and used, stale_fields YES, UR
       connections.loc["PG_HOST_URL"].to_string())
 check("dataset on that connection: the URL user as Oracle login user",
       candidates("SALES", "via_url") == [("CANDIDATE", "LOGIN_USER", "SALES_DSSOUT", "LEDGER")], candidates("SALES", "via_url"))
+
+
+# --- audit_connection_mapping ----------------------------------------------------------------
+from dbmon.inventory import audit_connections  # noqa: E402
+audits = audit_connections(DATABASES, CONNECTION_MAPPING)
+check("admin connections are their own audit connection",
+      audits["ADM_PG_APP"] == [("ADM_PG_APP", "PG app")] and audits["ADM_ORA"] == [("ADM_ORA", "ORA")])
+check("a mapped connection leads to its admin connection and label",
+      audits["PG_SALES"] == [("ADM_PG_APP", "PG app")] and audits["ORA_URL"] == [("ADM_ORA", "ORA")])
+check("mapped to an admin connection databases does not list: nothing", "ORA_LOST" not in audits)
+two = audit_connections(DATABASES, pd.DataFrame([("SHARED", "ADM_PG_APP"), ("SHARED", "ADM_ORA")],
+                                                columns=["dss_connection", "audit_connection"]))
+check("a connection mapped to two admin connections leads to both",
+      two["SHARED"] == [("ADM_PG_APP", "PG app"), ("ADM_ORA", "ORA")])
+names = results["dss_dataset_locations"].drop_duplicates(["project_key", "dataset_name"]).set_index(
+    ["project_key", "dataset_name"])
+check("connection_name = the dataset's own connection, audit_connection_name = the mapped admin connection",
+      names.loc[("SALES", "raw_orders"), ["connection_name", "audit_connection_name"]].tolist()
+      == ["PG_SALES", "ADM_PG_APP"]
+      and names.loc[("SALES", "orders_ora"), ["connection_name", "audit_connection_name"]].tolist()
+      == ["ORA_SALES", "ADM_ORA"])
+check("unmapped connection: audit_connection_name empty",
+      names.loc[("SALES", "elsewhere"), "connection_name"] == "PG_UNMAPPED"
+      and pd.isna(names.loc[("SALES", "elsewhere"), "audit_connection_name"]))
+without_mapping = inventory.collect_inventory(FakeClient(), DATABASES, role_settings)
+unmapped = without_mapping["dss_dataset_locations"]
+check("without the mapping: datasets of non-admin connections are UNMAPPED",
+      set(unmapped[unmapped.dataset_name == "raw_orders"].candidate_status) == {"UNMAPPED"})
 
 finish()

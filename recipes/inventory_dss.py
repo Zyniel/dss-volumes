@@ -2,9 +2,10 @@
 #
 # Run it as a user with an admin API key (scenario "Run as" an admin), after collect_storage.
 #
-# Inputs  databases              the same dataset as collect_storage. Optional column
-#                                dss_connections: the DSS connections pointing to that
-#                                database, comma separated
+# Inputs  databases              the same dataset as collect_storage: admin connections, labels
+#         audit_connection_mapping  one row per DSS connection used by datasets: dss_connection,
+#                                and audit_connection, the admin connection of databases
+#                                that exports its tables
 #         role_settings          from collect_storage: the latest day is used
 # Outputs dss_projects           one row per project: tags, use case
 #         dss_datasets           one row per dataset: settings, storage, sharing, metrics
@@ -57,13 +58,15 @@ if hasattr(dataiku, "dku_flow_variables"):
 # ---------------------------------------------------------------------------------------
 databases = dataiku.Dataset("databases").get_dataframe()
 role_settings = latest_day(dataiku.Dataset("role_settings").get_dataframe())
+connection_mapping = dataiku.Dataset("audit_connection_mapping").get_dataframe()
 
 location_reader = None
 if USE_DSS_LOCATION:
     location_reader = read_location
 
 client = dataiku.api_client()
-results = inventory.collect_inventory(client, databases, role_settings, location_reader, parallel=PARALLEL)
+results = inventory.collect_inventory(client, databases, role_settings, location_reader, parallel=PARALLEL,
+                                      connection_mapping=connection_mapping)
 
 # ---------------------------------------------------------------------------------------
 # Write, every row starting with the day of the run. Every output gets its declared schema

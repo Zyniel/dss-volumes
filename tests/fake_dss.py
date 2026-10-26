@@ -10,11 +10,23 @@ BROKEN  its flow graph cannot be read: the project fails.
 """
 import pandas as pd
 
-# The databases dataset of the tests: admin connections and the DSS connections they hold
+# The databases dataset of the tests: the admin connections
 DATABASES = pd.DataFrame([
-    ("ADM_PG_APP", "postgresql", "PG app", "PG_SALES,PG_PERUSER, PG_POSTCONNECT"),
-    ("ADM_ORA", "oracle", "ORA", "ORA_SALES,ORA_URL"),
-], columns=["connection", "engine", "label", "dss_connections"])
+    ("ADM_PG_APP", "postgresql", "PG app"),
+    ("ADM_ORA", "oracle", "ORA"),
+], columns=["connection", "engine", "label"])
+
+# The audit_connection_mapping dataset: connections used by datasets -> admin connection.
+# PG_UNMAPPED is missing on purpose; ORA_LOST is mapped to an admin connection databases
+# does not list.
+CONNECTION_MAPPING = pd.DataFrame([
+    ("PG_SALES", "ADM_PG_APP"),
+    ("PG_PERUSER", "ADM_PG_APP"),
+    (" PG_POSTCONNECT ", "ADM_PG_APP"),
+    ("ORA_SALES", "ADM_ORA"),
+    ("ORA_URL", "ADM_ORA"),
+    ("ORA_LOST", "ADM_NOT_LISTED"),
+], columns=["dss_connection", "audit_connection"])
 
 
 def dataset(name, dataset_type, connection=None, schema="", table="", mode="table", managed=False,
