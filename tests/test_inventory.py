@@ -21,7 +21,7 @@ role_settings = step1["role_settings"]
 
 # --- inventory -----------------------------------------------------------------------------
 results = inventory.collect_inventory(FakeClient(), DATABASES, role_settings)
-check("outputs", sorted(results) == ["dss_connections", "dss_dataset_locations", "dss_datasets",
+check("outputs", sorted(results) == ["dss_connections", "dss_dataset_locations", "dss_dataset_shares", "dss_datasets",
                                     "dss_flow_links", "dss_projects", "inventory_log"], sorted(results))
 
 log = results["inventory_log"].set_index("project_key")
@@ -51,7 +51,10 @@ check("dss_datasets: variables replaced, local project variable overriding stand
       and datasets.loc[("FIN", "fin_summary"), "resolved_schema"] == "fin_dssout"
       and datasets.loc[("SALES", "notes_file"), "resolved_path"] == "SALES/notes")
 shared = datasets.loc[("SALES", "orders_clean")]
-check("dss_datasets: orders_clean shared with FIN", shared.shared == "YES" and shared.shared_with == "FIN")
+shares = results["dss_dataset_shares"]
+check("sharing: orders_clean shared with 1 project, one row per target in dss_dataset_shares",
+      shared.shared == "YES" and shared.n_shared_with == 1 and "shared_with" not in datasets.columns
+      and shares.values.tolist() == [["SALES", "orders_clean", "FIN"]], shares.to_string())
 check("metrics: rows, YES", datasets.loc[("SALES", "raw_orders"), ["metric_rows", "is_populated"]].tolist() == [3000, "YES"])
 check("metrics: 0 rows, NO", datasets.loc[("SALES", "orders_clean"), "is_populated"] == "NO")
 check("metrics: partitions summed when there is no whole-dataset value",
@@ -130,5 +133,22 @@ for name in in_parallel:
     same = parallel_rows.fillna("-").astype(str).equals(sequential_rows.fillna("-").astype(str))
     check("parallel = 4 and parallel = 1 give the same %s, same order" % name, same)
 check("inventory_log: seconds per project", in_parallel["inventory_log"]["seconds"].notna().all())
+
+
+# --- long values: a dataset shared with 1000 projects, a 15000-character note --------------------
+from dbmon import schemas  # noqa: E402
+many = pd.DataFrame({"project_key": ["P"] * 1000, "dataset_name": ["d"] * 1000,
+                     "target_project": ["PROJECT_%04d" % i for i in range(1000)]})
+check("1000 sharing projects: 1000 rows, each value short",
+      len(schemas.conform(many, "dss_dataset_shares")) == 1000)
+long_note = schemas.conform(pd.DataFrame({"note": ["x" * 15000]}), "dss_dataset_locations")["note"].iloc[0]
+check("free text over the limit is cut to the declared length, ending with ...",
+      len(long_note) == schemas.LONG_TEXT_LENGTH and long_note.endswith("..."))
+declared = schemas.dss_schema("dss_datasets")
+lengths_ok = True
+for column in declared:
+    if column["type"] == "string" and "maxLength" not in column:
+        lengths_ok = False
+check("every string column has a declared maxLength", lengths_ok)
 
 finish()

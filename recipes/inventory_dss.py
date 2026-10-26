@@ -8,6 +8,7 @@
 #         role_settings          from collect_storage: the latest day is used
 # Outputs dss_projects           one row per project: tags, use case
 #         dss_datasets           one row per dataset: settings, storage, sharing, metrics
+#         dss_dataset_shares     one row per shared dataset and project it is exposed to
 #         dss_flow_links         one row per recipe input or output
 #         dss_connections        one row per connection
 #         dss_dataset_locations  one row per dataset and candidate schema, best first

@@ -129,9 +129,9 @@ except ValueError as error:
 INPUTS["databases"] = DATABASES
 INPUTS["role_settings"] = pg_run_settings
 printed = run_recipe("inventory_dss.py", {"DKU_DST_snapshot_day": today})
-INVENTORY_OUTPUTS = ["dss_connections", "dss_dataset_locations", "dss_datasets", "dss_flow_links", "dss_projects",
-                     "inventory_log"]
-check("inventory: the six outputs written", sorted(WRITTEN) == INVENTORY_OUTPUTS, sorted(WRITTEN))
+INVENTORY_OUTPUTS = ["dss_connections", "dss_dataset_locations", "dss_dataset_shares", "dss_datasets", "dss_flow_links",
+                     "dss_projects", "inventory_log"]
+check("inventory: the seven outputs written", sorted(WRITTEN) == INVENTORY_OUTPUTS, sorted(WRITTEN))
 check("inventory: summary with the failed project", "2 of 3 projects read" in printed and "FAILED BROKEN" in printed,
       printed)
 inventory_declared = True

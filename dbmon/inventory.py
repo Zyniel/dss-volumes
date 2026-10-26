@@ -4,6 +4,7 @@ may be stored. Read through the DSS public API, with an admin API key. Notebooks
 Results (step 2, extraction only: nothing here reads the step 1 tables):
 - dss_projects           one row per project: tags, use case and where it comes from
 - dss_datasets           one row per dataset: settings, storage as configured, sharing, metrics
+- dss_dataset_shares     one row per shared dataset and project it is exposed to
 - dss_flow_links         one row per recipe input or output (the flow graph of every project)
 - dss_connections        one row per connection: where it points (no secret)
 - dss_dataset_locations  one row per dataset and candidate schema, best candidate first
@@ -52,6 +53,7 @@ VARIABLE = re.compile(r"\$\{([^}]+)\}")
 
 LINK_COLUMNS = ["project_key", "recipe_name", "recipe_type", "direction",
                 "dataset_project", "dataset_name", "foreign"]
+SHARE_COLUMNS = ["project_key", "dataset_name", "target_project"]
 LOCATION_COLUMNS = ["project_key", "dataset_name", "candidate_rank", "candidate_status",
                     "database_label", "schema_name", "table_name", "schema_source", "note"]
 
@@ -90,6 +92,7 @@ def collect_inventory(client, databases, role_settings, read_location=None, para
     projects = []
     links = []
     datasets = []
+    shares = []
     dss_locations = {}
     log_entries = []
     for outcome in outcomes:
@@ -99,6 +102,7 @@ def collect_inventory(client, databases, role_settings, read_location=None, para
         projects.append(outcome["project_row"])
         links.extend(outcome["links"])
         datasets.extend(outcome["datasets"])
+        shares.extend(outcome["shares"])
         dss_locations.update(outcome["dss_locations"])
 
     connections = read_connections(client)
@@ -107,6 +111,7 @@ def collect_inventory(client, databases, role_settings, read_location=None, para
     return {
         "dss_projects": pd.DataFrame(projects),
         "dss_datasets": pd.DataFrame(datasets),
+        "dss_dataset_shares": pd.DataFrame(shares, columns=SHARE_COLUMNS),
         "dss_flow_links": pd.DataFrame(links, columns=LINK_COLUMNS),
         "dss_connections": connections,
         "dss_dataset_locations": pd.DataFrame(locations, columns=LOCATION_COLUMNS),
@@ -116,7 +121,7 @@ def collect_inventory(client, databases, role_settings, read_location=None, para
 
 def read_one_project(client, project, instance_variables, read_location):
     """Everything read from one project, as a dict: log_entry, project_row (None when the
-    project failed), links, datasets, dss_locations."""
+    project failed), links, datasets, shares, dss_locations."""
     project_key = project["projectKey"]
     started = time.time()
     outcome = {
@@ -124,11 +129,12 @@ def read_one_project(client, project, instance_variables, read_location):
         "project_row": None,
         "links": [],
         "datasets": [],
+        "shares": [],
         "dss_locations": {},
     }
 
     try:
-        project_row, project_links, project_datasets = read_project(client, project, instance_variables)
+        project_row, project_links, project_datasets, project_shares = read_project(client, project, instance_variables)
     except Exception as error:
         outcome["log_entry"]["status"] = "FAILED"
         outcome["log_entry"]["error"] = str(error)[:2000]  # first 2000 characters
@@ -144,6 +150,7 @@ def read_one_project(client, project, instance_variables, read_location):
     outcome["project_row"] = project_row
     outcome["links"] = project_links
     outcome["datasets"] = project_datasets
+    outcome["shares"] = project_shares
     outcome["log_entry"]["datasets"] = len(project_datasets)
     outcome["log_entry"]["links"] = len(project_links)
     outcome["log_entry"]["seconds"] = round(time.time() - started, 1)
@@ -155,7 +162,7 @@ def read_one_project(client, project, instance_variables, read_location):
 # ---------------------------------------------------------------------------------------
 
 def read_project(client, project, instance_variables):
-    """(project row, flow links, datasets) of one project."""
+    """(project row, flow links, datasets, shares) of one project."""
     project_key = project["projectKey"]
     project_handle = client.get_project(project_key)
 
@@ -174,6 +181,7 @@ def read_project(client, project, instance_variables):
     links = read_flow_links(project_handle, project_key)
 
     datasets = []
+    shares = []
     for item in project_handle.list_datasets():
         raw = item._data
         dataset_name = raw["name"]
@@ -203,10 +211,12 @@ def read_project(client, project, instance_variables):
         dataset["resolved_table"] = substitute_variables(dataset["table"], variables)
         dataset["resolved_path"] = substitute_variables(dataset["path"], variables)
 
-        # Sharing
+        # Sharing: one row per target project in dss_dataset_shares, the count here
         targets = shared_with.get(dataset_name, [])
         dataset["shared"] = yes_no(len(targets) > 0)
-        dataset["shared_with"] = join_values(targets)
+        dataset["n_shared_with"] = len(targets)
+        for target in targets:
+            shares.append({"project_key": project_key, "dataset_name": dataset_name, "target_project": target})
 
         # Metrics last computed by DSS
         partition = ""
@@ -223,7 +233,7 @@ def read_project(client, project, instance_variables):
 
         datasets.append(dataset)
 
-    return project_row, links, datasets
+    return project_row, links, datasets, shares
 
 
 def read_flow_links(project_handle, project_key):

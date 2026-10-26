@@ -121,7 +121,7 @@ check("roles: source, targets, orphans",
       and role[("SALES", "orders_ora")] == "target" and role[("FIN", "fin_summary")] == "target"
       and role[("FIN", "dup_writer")] == "target" and role[("SALES", "old_copy")] == "orphan", role)
 check("roles: orders_clean read by FIN, 1 producer, 1 consumer",
-      roles.loc[("SALES", "orders_clean"), ["n_producers", "n_consumers", "consuming_projects"]].tolist() == [1, 1, "FIN"])
+      roles.loc[("SALES", "orders_clean"), ["n_producers", "n_consumers", "n_consuming_projects"]].tolist() == [1, 1, 1])
 
 
 # --- dataset_tables ----------------------------------------------------------------------------
@@ -160,7 +160,7 @@ check("read by a source dataset only: READ_ONLY",
 ledger = owned.loc[("PG app", "fin_dssout", "ledger")]
 check("owned by FIN, also pointed to by a SALES orphan dataset",
       ledger.status == "OWNED" and ledger.owner_project == "FIN" and ledger.n_orphan_datasets == 1
-      and ledger.referencing_projects == "FIN,SALES")
+      and ledger.n_referencing_projects == 2)
 check("only an out-of-pipeline dataset points to it: NO_FLOW",
       owned.loc[("PG app", "appx", "mv_totals"), "status"] == "NO_FLOW")
 check("Oracle table owned by SALES", owned.loc[("ORA", "SALES_DSSWORK", "ORDERS"), ["status", "owner_project"]].tolist()

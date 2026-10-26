@@ -5,9 +5,24 @@ depends on the data: it stays the same from one day to the next.
 Adding a column to a SQL file: add it here too, at the same place. A column that is not
 declared here stops the recipe with its name.
 
-Types are DSS types: string, bigint, double, date.
+Types are DSS types: string, bigint, double, date. A string column has a maximum length,
+written in the schema (maxLength) so that DSS creates the column with it; a longer value is
+cut, ending with "...", so that a write never fails. Lists of values are never stored in
+one string: they are datasets of their own (dss_dataset_shares, dss_flow_links).
 """
 import pandas as pd
+
+# Maximum length of a string column, in characters
+STRING_LENGTH = 1000
+# Free text: errors, notes, JSON of connection settings, paths, lists of tablespaces.
+# 4000 fits an Oracle VARCHAR2. If DSS creates NVARCHAR2 columns on your connection
+# (2000 characters at most), set 2000.
+LONG_TEXT_LENGTH = 4000
+LONG_TEXT_COLUMNS = (
+    "error", "note", "jdbc_properties", "post_connect_statements", "naming_rule",
+    "project_tags", "location", "tablespaces", "compression", "search_path",
+    "path", "resolved_path", "partition_dimensions",
+)
 
 # In front of every row of storage_units, role_settings, objects and tables
 FRONT = [
@@ -117,10 +132,16 @@ SCHEMAS = {
         ("resolved_table", "string"),
         ("resolved_path", "string"),
         ("shared", "string"),
-        ("shared_with", "string"),
+        ("n_shared_with", "bigint"),
         ("metric_rows", "bigint"),
         ("metric_size", "double"),
         ("is_populated", "string"),
+    ],
+    "dss_dataset_shares": [
+        ("snapshot_day", "string"),
+        ("project_key", "string"),
+        ("dataset_name", "string"),
+        ("target_project", "string"),
     ],
     "dss_dataset_locations": [
         ("snapshot_day", "string"),
@@ -171,11 +192,21 @@ SCHEMAS = {
 }
 
 
+def string_length(column_name):
+    """Maximum length of a string column."""
+    if column_name in LONG_TEXT_COLUMNS:
+        return LONG_TEXT_LENGTH
+    return STRING_LENGTH
+
+
 def dss_schema(dataset_name):
     """The schema of an output dataset, as dataiku.Dataset.write_schema expects it."""
     columns = []
     for column_name, column_type in SCHEMAS[dataset_name]:
-        columns.append({"name": column_name, "type": column_type})
+        column = {"name": column_name, "type": column_type}
+        if column_type == "string":
+            column["maxLength"] = string_length(column_name)
+        columns.append(column)
     return columns
 
 
@@ -200,12 +231,13 @@ def conform(rows, dataset_name):
             values = rows[column_name]
         else:
             values = pd.Series([None] * len(rows), index=rows.index, dtype=object)
-        result[column_name] = typed(values, column_type)
+        result[column_name] = typed(values, column_type, string_length(column_name))
     return result.reset_index(drop=True)
 
 
-def typed(values, column_type):
-    """values converted to the pandas type that DSS writes as column_type."""
+def typed(values, column_type, max_length):
+    """values converted to the pandas type that DSS writes as column_type. Strings longer
+    than max_length are cut, ending with "..."."""
     if column_type == "bigint":
         numbers = pd.to_numeric(values, errors="coerce")
         return numbers.round().astype("Int64")
@@ -219,8 +251,11 @@ def typed(values, column_type):
     for value in values:
         if value is None or (not isinstance(value, str) and pd.isna(value)):
             texts.append(None)
-        else:
-            texts.append(str(value))
+            continue
+        text = str(value)
+        if len(text) > max_length:
+            text = text[:max_length - 3] + "..."
+        texts.append(text)
     return pd.Series(texts, index=values.index, dtype=object)
 
 

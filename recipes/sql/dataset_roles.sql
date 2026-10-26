@@ -10,7 +10,7 @@
 --                     orphan: neither input nor output of any recipe
 -- n_producers         recipes writing the dataset
 -- n_consumers         recipes reading it, in any project
--- consuming_projects  other projects whose recipes read it, comma separated
+-- n_consuming_projects  other projects whose recipes read it (the list: dss_flow_links)
 -- =============================================================================
 WITH
 datasets AS (
@@ -23,10 +23,8 @@ link_counts AS (
          l."dataset_name",
          SUM(CASE WHEN l."direction" = 'output' THEN 1 ELSE 0 END)           AS "n_producers",
          SUM(CASE WHEN l."direction" = 'input'  THEN 1 ELSE 0 END)           AS "n_consumers",
-         LISTAGG(DISTINCT CASE WHEN l."direction" = 'input' AND l."foreign" = 'YES'
-                               THEN l."project_key" END, ',')
-           WITHIN GROUP (ORDER BY CASE WHEN l."direction" = 'input' AND l."foreign" = 'YES'
-                                       THEN l."project_key" END)             AS "consuming_projects"
+         COUNT(DISTINCT CASE WHEN l."direction" = 'input' AND l."foreign" = 'YES'
+                             THEN l."project_key" END)                      AS "n_consuming_projects"
   FROM   "dss_flow_links" l
   WHERE  l."snapshot_day" = '$DKU_DST_snapshot_day'
   GROUP  BY l."dataset_project", l."dataset_name"
@@ -36,7 +34,7 @@ SELECT '$DKU_DST_snapshot_day'                                               AS 
        d."dataset_name",
        NVL(c."n_producers", 0)                                               AS "n_producers",
        NVL(c."n_consumers", 0)                                               AS "n_consumers",
-       c."consuming_projects",
+       NVL(c."n_consuming_projects", 0)                                      AS "n_consuming_projects",
        CASE
          WHEN NVL(c."n_producers", 0) > 0 THEN 'target'
          WHEN NVL(c."n_consumers", 0) > 0 THEN 'source'

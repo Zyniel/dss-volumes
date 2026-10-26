@@ -14,7 +14,7 @@
 --                project key, then dataset name, and multiple_owners = YES
 -- n_target_datasets, n_source_datasets, n_orphan_datasets
 --                datasets pointing to the table, by flow role
--- referencing_projects  projects of all those datasets, comma separated
+-- n_referencing_projects  projects of all those datasets (the list: dataset_tables)
 -- schema_use_case, schema_layer
 --                from the schema name <UC>_DSSWORK / <UC>_DSSOUT (upper case). Empty
 --                outside the convention
@@ -44,7 +44,7 @@ counts AS (
          SUM(CASE WHEN p."flow_role" = 'target' THEN 1 ELSE 0 END)           AS "n_target_datasets",
          SUM(CASE WHEN p."flow_role" = 'source' THEN 1 ELSE 0 END)           AS "n_source_datasets",
          SUM(CASE WHEN p."flow_role" = 'orphan' THEN 1 ELSE 0 END)           AS "n_orphan_datasets",
-         LISTAGG(DISTINCT p."project_key", ',') WITHIN GROUP (ORDER BY p."project_key") AS "referencing_projects"
+         COUNT(DISTINCT p."project_key")                                     AS "n_referencing_projects"
   FROM   pointing p
   GROUP  BY p."database_label", p."schema_name", p."table_name"
 ),
@@ -81,7 +81,7 @@ SELECT '$DKU_DST_snapshot_day'                                               AS 
        NVL(c."n_target_datasets", 0)                                         AS "n_target_datasets",
        NVL(c."n_source_datasets", 0)                                         AS "n_source_datasets",
        NVL(c."n_orphan_datasets", 0)                                         AS "n_orphan_datasets",
-       c."referencing_projects",
+       NVL(c."n_referencing_projects", 0)                                    AS "n_referencing_projects",
        REGEXP_SUBSTR(UPPER(t."schema_name"), '^(.+)_(DSSWORK|DSSOUT)$', 1, 1, NULL, 1) AS "schema_use_case",
        REGEXP_SUBSTR(UPPER(t."schema_name"), '^(.+)_(DSSWORK|DSSOUT)$', 1, 1, NULL, 2) AS "schema_layer"
 FROM   step1_tables t

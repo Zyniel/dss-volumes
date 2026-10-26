@@ -8,7 +8,7 @@ Earlier work is kept as reference only in [archive/](archive/README.md).
 
 ```
 databases (editable) ─► 1 Database inventory  (Python runs SQL)  ─► storage_units, role_settings, objects, tables, collect_log
-DSS API              ─► 2 Dataiku inventory   (Python, DSS API)  ─► dss_projects, dss_datasets, dss_flow_links,
+DSS API              ─► 2 Dataiku inventory   (Python, DSS API)  ─► dss_projects, dss_datasets, dss_dataset_shares, dss_flow_links,
                                                                      dss_connections, dss_dataset_locations, inventory_log
                         3 Analysis            (Oracle SQL)       ─► dataset_roles, dataset_tables, table_ownership,
                                                                      project_consumption
@@ -109,7 +109,7 @@ An object that belongs to no table (sequence, cluster, temporary segment of a st
 
 - Each SQL file runs as-is in SQL*Plus, SQLcl or psql: try a change there first.
 - Both engines return the same columns in the same order, because their rows go to the same dataset. A column that does not exist on one engine is `NULL` there.
-- Declare a new column in [dbmon/schemas.py](dbmon/schemas.py), at the same place. The recipes write that schema on every run, even when a result has no row (Oracle `role_settings` is always empty), so the datasets always have a schema and it never changes with the data. A column missing from `schemas.py` stops the recipe with its name.
+- Declare a new column in [dbmon/schemas.py](dbmon/schemas.py), at the same place. The recipes write that schema on every run, even when a result has no row (Oracle `role_settings` is always empty), so the datasets always have a schema and it never changes with the data. A column missing from `schemas.py` stops the recipe with its name. Every string column has a maximum length there (`STRING_LENGTH`, `LONG_TEXT_LENGTH` for free text), written to DSS as `maxLength`; a longer value is cut, ending with `...`. A list of values never goes in one string: it becomes a dataset of its own, with one row per value, and a count (`n_*`) where it came from.
 - Oracle files keep SQL*Plus rules: no blank line inside the statement, no `&`.
 - Run [tests/test_collect.py](tests/README.md) afterwards.
 
@@ -120,7 +120,7 @@ An object that belongs to no table (sequence, cluster, temporary segment of a st
 ### Set up
 
 1. In `databases`, add the optional column `dss_connections`: the DSS connections that point to that database, comma separated. That is how a dataset is tied to a monitored database.
-2. Create a Python recipe with `databases` and `role_settings` as inputs, and `dss_projects`, `dss_datasets`, `dss_flow_links`, `dss_connections`, `dss_dataset_locations` and `inventory_log` as outputs. Paste [recipes/inventory_dss.py](recipes/inventory_dss.py). Partition the outputs by day like step 1; it uses the latest day of `role_settings`.
+2. Create a Python recipe with `databases` and `role_settings` as inputs, and `dss_projects`, `dss_datasets`, `dss_dataset_shares`, `dss_flow_links`, `dss_connections`, `dss_dataset_locations` and `inventory_log` as outputs. Paste [recipes/inventory_dss.py](recipes/inventory_dss.py). Partition the outputs by day like step 1; it uses the latest day of `role_settings`.
 3. Run it in the same scenario, after step 1, as a user with an admin API key ("Run as" in the scenario settings): connections and instance variables need admin rights.
 
 ### Datasets
@@ -128,7 +128,8 @@ An object that belongs to no table (sequence, cluster, temporary segment of a st
 | Dataset | One row per | Content |
 |---|---|---|
 | `dss_projects` | project | `project_name`, `project_tags`, `use_case`, `use_case_source` (`TAG`, `RULE` or `NONE`, see [use case](#use-case-of-a-project)) |
-| `dss_datasets` | dataset | type, `managed`, partitioning, `connection`, `mode`, `schema`, `table`, `catalog`, `path`; the same with `${...}` replaced (`resolved_*`: instance, then project standard, then project local variables, and `projectKey`); `shared`, `shared_with`; `metric_rows`, `metric_size` (MB) and `is_populated` (`YES`, `NO`, `UNKNOWN`) from the metrics DSS last computed (never computed by dbmon) |
+| `dss_datasets` | dataset | type, `managed`, partitioning, `connection`, `mode`, `schema`, `table`, `catalog`, `path`; the same with `${...}` replaced (`resolved_*`: instance, then project standard, then project local variables, and `projectKey`); `shared`, `n_shared_with` (the projects themselves: `dss_dataset_shares`); `metric_rows`, `metric_size` (MB) and `is_populated` (`YES`, `NO`, `UNKNOWN`) from the metrics DSS last computed (never computed by dbmon) |
+| `dss_dataset_shares` | shared dataset and project it is exposed to | `project_key`, `dataset_name`, `target_project` |
 | `dss_flow_links` | recipe input or output | `project_key`, `recipe_name`, `recipe_type`, `direction`, `dataset_project`, `dataset_name`, `foreign` (dataset of another project). From each project's flow graph; managed folders and models are left out |
 | `dss_connections` | connection | `connection_type`, `credentials_mode`, `host`, `port`, `database_or_service`, `login_user`, `default_schema`, `jdbc_properties`, `post_connect_statements`, `naming_rule`. No password or other secret |
 | `dss_dataset_locations` | dataset and candidate schema | `candidate_rank` (best first), `candidate_status`, `database_label`, `schema_name`, `table_name`, `schema_source`, `note` |
@@ -161,9 +162,9 @@ Four DSS SQL query recipes on the Oracle connection holding the monitoring datas
 
 | Recipe | Inputs | Output, one row per | Content |
 |---|---|---|---|
-| [dataset_roles.sql](recipes/sql/dataset_roles.sql) | `dss_datasets`, `dss_flow_links` | `dataset_roles`: dataset | `n_producers`, `n_consumers`, `consuming_projects`, `flow_role`: `target` (output of a recipe), `source` (input, output of none), `orphan` (neither) |
+| [dataset_roles.sql](recipes/sql/dataset_roles.sql) | `dss_datasets`, `dss_flow_links` | `dataset_roles`: dataset | `n_producers`, `n_consumers`, `n_consuming_projects`, `flow_role`: `target` (output of a recipe), `source` (input, output of none), `orphan` (neither) |
 | [dataset_tables.sql](recipes/sql/dataset_tables.sql) | `dss_dataset_locations`, `tables` | `dataset_tables`: dataset | `match_status` (`FOUND`, `AMBIGUOUS`, `NOT_FOUND`, or the reason there is no candidate), `database_label`, `schema_name`, `table_name` (as in the database when found), the candidate kept |
-| [table_ownership.sql](recipes/sql/table_ownership.sql) | `tables`, `dataset_tables`, `dataset_roles` | `table_ownership`: step 1 table | its sizes, `status`, `owner_project`, `owner_dataset`, `multiple_owners`, datasets pointing to it by role, `referencing_projects`, `schema_use_case`, `schema_layer` |
+| [table_ownership.sql](recipes/sql/table_ownership.sql) | `tables`, `dataset_tables`, `dataset_roles` | `table_ownership`: step 1 table | its sizes, `status`, `owner_project`, `owner_dataset`, `multiple_owners`, datasets pointing to it by role, `n_referencing_projects`, `schema_use_case`, `schema_layer` |
 | [project_consumption.sql](recipes/sql/project_consumption.sql) | `dss_projects`, `dataset_roles`, `dataset_tables`, `table_ownership` | `project_consumption`: project | `use_case`, datasets by role and match, `n_owned_tables`, `owned_mb` (and by family), `read_mb`, `no_flow_mb` |
 
 `table_ownership.status`:
