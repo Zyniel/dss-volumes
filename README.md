@@ -26,6 +26,7 @@ DSS API              ─► 2 Inventory   (DSS API)         ─► dss_datasets,
 dbmon/                    Python package, imported in the DSS project library as python/dbmon
 ├── collect.py            runs the SQL files through each admin connection, sums objects per table
 ├── inventory.py          DSS datasets, flow roles, storage locations (step 2)
+├── schemas.py            schema of every output dataset
 ├── use_case.py           use case of a DSS project
 └── sql/
     ├── oracle/           identity, storage_units, role_settings, objects
@@ -107,6 +108,7 @@ An object that belongs to no table (sequence, cluster, temporary segment of a st
 
 - Each SQL file runs as-is in SQL*Plus, SQLcl or psql: try a change there first.
 - Both engines return the same columns in the same order, because their rows go to the same dataset. A column that does not exist on one engine is `NULL` there.
+- Declare a new column in [dbmon/schemas.py](dbmon/schemas.py), at the same place. The recipes write that schema on every run, even when a result has no row (Oracle `role_settings` is always empty), so the datasets always have a schema and it never changes with the data. A column missing from `schemas.py` stops the recipe with its name.
 - Oracle files keep SQL*Plus rules: no blank line inside the statement, no `&`.
 - Run [tests/test_collect.py](tests/README.md) afterwards.
 

@@ -17,7 +17,7 @@ import datetime
 
 import dataiku
 
-from dbmon import inventory
+from dbmon import inventory, schemas
 
 # Also ask DSS for the location it resolves itself (dataiku.Dataset.get_location_info).
 # False: resolve from the dataset and connection settings only.
@@ -60,15 +60,14 @@ client = dataiku.api_client()
 results = inventory.collect_inventory(client, databases, tables, role_settings, location_reader)
 
 # ---------------------------------------------------------------------------------------
-# Write, every row starting with the day of the run
+# Write, every row starting with the day of the run. Every output gets its declared schema
+# (dbmon/schemas.py), even when it has no row.
 # ---------------------------------------------------------------------------------------
 for name in results:
     rows = results[name]
-    if rows.empty:
-        print("%s: no rows in this run, dataset left as it is" % name)
-        continue
-    rows.insert(0, "snapshot_day", day)
-    dataiku.Dataset(name).write_with_schema(rows)
+    rows["snapshot_day"] = day
+    written = schemas.write(dataiku.Dataset(name), rows, name)
+    print("%s: %d rows" % (name, len(written)))
 
 log = results["inventory_log"]
 failed = log[log["status"] == "FAILED"]

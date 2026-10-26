@@ -18,7 +18,7 @@ import datetime
 
 import dataiku
 
-from dbmon import collect
+from dbmon import collect, schemas
 
 # Databases read at the same time. 1: one after the other.
 PARALLEL = 4
@@ -48,15 +48,14 @@ results, log = collect.collect_all(databases, parallel=PARALLEL)
 results["collect_log"] = log
 
 # ---------------------------------------------------------------------------------------
-# Write, every row starting with the day of the run
+# Write, every row starting with the day of the run. Every output gets its declared schema
+# (dbmon/schemas.py), even when it has no row.
 # ---------------------------------------------------------------------------------------
 for name in results:
     rows = results[name]
-    if rows.empty:
-        print("%s: no rows in this run, dataset left as it is" % name)
-        continue
-    rows.insert(0, "snapshot_day", day)
-    dataiku.Dataset(name).write_with_schema(rows)
+    rows["snapshot_day"] = day
+    written = schemas.write(dataiku.Dataset(name), rows, name)
+    print("%s: %d rows" % (name, len(written)))
 
 # ---------------------------------------------------------------------------------------
 # Summary in the job log
