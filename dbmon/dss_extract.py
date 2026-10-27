@@ -28,6 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 
+from dbmon import progress
 from dbmon.utils.jdbc_parser import parse_jdbc
 
 METRIC_ROWS = "records:COUNT_RECORDS"
@@ -62,15 +63,18 @@ def extract_dss(client, parallel=4, metrics=METRICS_ALL):
     parallel  projects read at the same time. 1: one after the other
     metrics   ALL: read the last computed metrics of every dataset and folder. NONE: none
     """
+    started = time.time()
     instance_variables = read_instance_variables(client)
     project_list = client.list_projects()
 
     workers = int(parallel)
     if workers < 1:
         workers = 1
+    progress.log("DSS extraction: %d projects, %d at the same time, metrics %s" % (len(project_list), workers, metrics))
+    counter = progress.Counter(len(project_list))
 
     def read_one(project):
-        return read_one_project(client, project, instance_variables, metrics)
+        return read_one_project(client, project, instance_variables, metrics, counter)
 
     # Read the projects, up to `workers` at the same time. map() keeps their order.
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -86,9 +90,19 @@ def extract_dss(client, parallel=4, metrics=METRICS_ALL):
         for name in results:
             results[name].extend(outcome[name])
 
+    n_failed = 0
+    for entry in log_entries:
+        if entry["status"] == "FAILED":
+            n_failed = n_failed + 1
+    progress.log("projects done: %d read, %d failed, %d datasets, %d folders, %d links in %s s"
+                 % (len(log_entries) - n_failed, n_failed, len(results["dss_datasets"]),
+                    len(results["dss_managed_folders"]), len(results["dss_flow_links"]), seconds_since(started)))
+
     connections, permissions = read_connections(client)
     groups = read_groups(client)
     users, members = read_users(client)
+    progress.log("security: %d groups, %d users, %d group memberships" % (len(groups), len(users), len(members)))
+    progress.log("DSS extraction done in %s s" % seconds_since(started))
 
     return {
         "dss_projects": pd.DataFrame(results["dss_projects"]),
@@ -110,8 +124,9 @@ def extract_dss(client, parallel=4, metrics=METRICS_ALL):
 # One project
 # ---------------------------------------------------------------------------------------
 
-def read_one_project(client, project, instance_variables, metrics):
-    """Everything read from one project, as a dict of row lists, plus its log entry."""
+def read_one_project(client, project, instance_variables, metrics, counter=None):
+    """Everything read from one project, as a dict of row lists, plus its log entry.
+    counter: progress.Counter of the projects done, for the progress traces."""
     project_key = project["projectKey"]
     started = time.time()
     outcome = {
@@ -127,12 +142,21 @@ def read_one_project(client, project, instance_variables, metrics):
                 outcome[name] = []
         outcome["log_entry"]["status"] = "FAILED"
         outcome["log_entry"]["error"] = str(error)[:2000]  # first 2000 characters
-        print("FAILED %s: %s" % (project_key, error))
     else:
         outcome["log_entry"]["datasets"] = len(outcome["dss_datasets"])
         outcome["log_entry"]["managed_folders"] = len(outcome["dss_managed_folders"])
         outcome["log_entry"]["links"] = len(outcome["dss_flow_links"])
-    outcome["log_entry"]["seconds"] = round(time.time() - started, 1)
+    outcome["log_entry"]["seconds"] = seconds_since(started)
+
+    done = ""
+    if counter is not None:
+        done = " " + counter.next()
+    entry = outcome["log_entry"]
+    if entry["status"] == "FAILED":
+        progress.log("project%s %s: FAILED in %s s: %s" % (done, project_key, entry["seconds"], entry["error"]))
+    else:
+        progress.log("project%s %s: OK, %d datasets, %d folders, %d links in %s s"
+                     % (done, project_key, entry["datasets"], entry["managed_folders"], entry["links"], entry["seconds"]))
     return outcome
 
 
@@ -157,6 +181,8 @@ def read_project(client, project, instance_variables, metrics, outcome):
     folder_items = project_handle.list_managed_folders()
     nodes = project_handle.get_flow().get_graph().data["nodes"]
     shared_with = read_exposed_datasets(project_handle)
+    progress.log("project %s: %d datasets, %d recipes, %d folders listed, reading their details"
+                 % (project_key, len(dataset_items), len(recipe_items), len(folder_items)))
 
     # Variables: only when a dataset or folder uses one other than projectKey
     raw_datasets = []
@@ -373,14 +399,18 @@ def read_connections(client):
     """(dss_connections, dss_connection_permissions), from the connection list (admin): one
     call. Connection details (get_info) only for the connections whose parameters hold
     variables or no user."""
+    started = time.time()
     rows = []
     permissions = []
+    n_details = 0
     listed = client.list_connections(as_type="dictitems")
+    progress.log("connections: %d listed, reading their details where needed" % len(listed))
     for name in listed:
         definition = raw_of(listed[name])
         params = definition.get("params") or {}
         info = definition
         if needs_connection_details(params):
+            n_details = n_details + 1
             try:
                 info = client.get_connection(name).get_info()
             except Exception as error:
@@ -388,6 +418,8 @@ def read_connections(client):
                 continue
         rows.append(connection_row(name, info, definition))
         permissions.extend(permission_rows(name, definition))
+    progress.log("connections done: %d, details read for %d, %d permission rows in %s s"
+                 % (len(rows), n_details, len(permissions), seconds_since(started)))
     return pd.DataFrame(rows), pd.DataFrame(permissions, columns=PERMISSION_COLUMNS)
 
 
@@ -724,6 +756,11 @@ def text_or_none(value):
     if value is None or value == "":
         return None
     return str(value)
+
+
+def seconds_since(started):
+    """Seconds elapsed since started (a time.time() value), one decimal."""
+    return round(time.time() - started, 1)
 
 
 def to_number(value):

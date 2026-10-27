@@ -9,13 +9,15 @@
 #                                   that exports its tables
 #         tables, role_settings     from collect_storage
 #         dss_projects, dss_project_tags, dss_datasets, dss_managed_folders, dss_flow_links,
-#         dss_connections           from extract_dss
+#         dss_connections, inventory_log   from extract_dss
 # Outputs dataset_roles             one row per dataset or folder: writers, readers, nature
 #         dataset_locations         one row per dataset and candidate schema, best first
 #         dataset_tables            one row per dataset: the step 1 table it is stored in
 #         table_ownership           one row per step 1 table: its space and its owner
 #         dataset_storage           one row per dataset or folder: storage kind, size, counted
 #         project_consumption       one row per project: the space it is responsible for
+#         database_usage            one row per database, schema and DSS relation: piloted
+#                                   space and possible waste
 #
 # The partitioned inputs are read for the day of the run (the most recent day they hold when
 # the recipe reads more than one).
@@ -23,10 +25,10 @@ import datetime
 
 import dataiku
 
-from dbmon import refine, schemas
+from dbmon import progress, refine, schemas
 
 DSS_INPUTS = ["dss_projects", "dss_project_tags", "dss_datasets", "dss_managed_folders", "dss_flow_links",
-              "dss_connections"]
+              "dss_connections", "inventory_log"]
 
 
 def latest_day(rows):
@@ -48,13 +50,25 @@ if hasattr(dataiku, "dku_flow_variables"):
 # ---------------------------------------------------------------------------------------
 # Read
 # ---------------------------------------------------------------------------------------
-databases = dataiku.Dataset("databases").get_dataframe()
-connection_mapping = dataiku.Dataset("audit_connection_mapping").get_dataframe()
-tables = latest_day(dataiku.Dataset("tables").get_dataframe())
-role_settings = latest_day(dataiku.Dataset("role_settings").get_dataframe())
+progress.log("refine_inventory: building the partition %s" % day)
+
+
+def read_input(name, latest_only):
+    """Rows of an input dataset (its latest day only when latest_only), with a progress trace."""
+    rows = dataiku.Dataset(name).get_dataframe()
+    if latest_only:
+        rows = latest_day(rows)
+    progress.log("%s: %d rows read" % (name, len(rows)))
+    return rows
+
+
+databases = read_input("databases", False)
+connection_mapping = read_input("audit_connection_mapping", False)
+tables = read_input("tables", True)
+role_settings = read_input("role_settings", True)
 dss = {}
 for name in DSS_INPUTS:
-    dss[name] = latest_day(dataiku.Dataset(name).get_dataframe())
+    dss[name] = read_input(name, True)
 
 results = refine.refine(dss, tables, role_settings, databases, connection_mapping)
 
@@ -65,5 +79,6 @@ results = refine.refine(dss, tables, role_settings, databases, connection_mappin
 for name in results:
     rows = results[name]
     rows["snapshot_day"] = day
+    progress.log("%s: writing %d rows" % (name, len(rows)))
     written = schemas.write(dataiku.Dataset(name), rows, name)
-    print("%s: %d rows" % (name, len(written)))
+    progress.log("%s: %d rows written" % (name, len(written)))

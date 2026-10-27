@@ -20,8 +20,8 @@ check("step 1 collected on both engines", (step1_log.status == "OK").all(), step
 step2 = dss_extract.extract_dss(FakeClient(), parallel=2)
 
 results = refine.refine(step2, step1["tables"], step1["role_settings"], DATABASES, CONNECTION_MAPPING)
-check("outputs", sorted(results) == ["dataset_locations", "dataset_roles", "dataset_storage", "dataset_tables",
-                                    "project_consumption", "table_ownership"], sorted(results))
+check("outputs", sorted(results) == ["database_usage", "dataset_locations", "dataset_roles", "dataset_storage",
+                                    "dataset_tables", "project_consumption", "table_ownership"], sorted(results))
 all_declared = True
 for name in results:
     try:
@@ -149,9 +149,63 @@ check("only unused datasets point to it: UNUSED", owned.loc[("PG app", "appx", "
 check("Oracle table owned by SALES", owned.loc[("ORA", "SALES_DSSWORK", "ORDERS"), ["status", "owner_project"]].tolist()
       == ["OWNED", "SALES"])
 check("no dataset: UNREFERENCED", owned.loc[("ORA", "SALES_DSSOUT", "IOT_T"), "status"] == "UNREFERENCED")
-check("use case and layer from the schema name",
-      owned.loc[("PG app", "sales_dsswork", "SALES_orders"), ["schema_use_case", "schema_layer"]].tolist()
-      == ["SALES", "DSSWORK"] and pd.isna(owned.loc[("PG app", "appx", "mv_totals"), "schema_use_case"]))
+check("use case and layer as detected by the naming rules of the database",
+      owned.loc[("PG app", "sales_dsswork", "SALES_orders"), ["detected_use_case", "detected_layer"]].tolist()
+      == ["SALES", "DSSWORK"] and pd.isna(owned.loc[("PG app", "appx", "mv_totals"), "detected_use_case"]))
+metrics_copied = True
+for metric in refine.TABLE_METRICS:
+    step1_total = step1["tables"][metric].sum()
+    if abs(ownership[metric].sum() - step1_total) > 0.01:
+        metrics_copied = False
+check("every metric of the step 1 tables copied, same totals", metrics_copied)
+
+# --- dss_relation: what DSS has to do with each table -------------------------------------------
+relation = owned.dss_relation.to_dict()
+check("dss_relation of each case",
+      relation[("PG app", "sales_dssout", "SALES_orders")] == "PILOTED"
+      and relation[("PG app", "sales_dsswork", "SALES_orders")] == "READ_BY_DSS"
+      and relation[("PG app", "appx", "mv_totals")] == "DECLARED_UNUSED"
+      and relation[("PG app", "appx", "seq1")] == "STANDALONE"
+      and relation[("ORA", "SALES_DSSOUT", "IOT_T")] == "UNRELATED_DSS_SCHEMA"
+      and relation[("ORA", "APPX", "NOTES")] == "UNRELATED", relation)
+check("DSS schema: named by a rule, or holding a table a dataset points to (PostgreSQL appx), not ORA APPX",
+      owned.loc[("ORA", "SALES_DSSOUT", "IOT_T"), "dss_schema"] == "YES"
+      and owned.loc[("PG app", "appx", "scratch"), ["dss_schema", "dss_relation"]].tolist()
+      == ["YES", "UNRELATED_DSS_SCHEMA"]
+      and owned.loc[("ORA", "APPX", "NOTES"), "dss_schema"] == "NO")
+check("owned only by idle managed datasets: PILOTED_IDLE",
+      refine.dss_relation({"standalone": "NO", "status": "OWNED", "owner_nature": "MANAGED_IDLE",
+                           "dss_schema": "YES"}) == "PILOTED_IDLE")
+waste = owned[owned.waste_candidate == "YES"].dss_relation
+check("waste candidates: idle, declared unused, unrelated in a DSS schema only",
+      set(waste) <= {"PILOTED_IDLE", "DECLARED_UNUSED", "UNRELATED_DSS_SCHEMA"}
+      and owned[owned.dss_relation == "UNRELATED"].waste_candidate.eq("NO").all() and len(waste) > 0)
+
+# --- database_usage -----------------------------------------------------------------------------
+usage = results["database_usage"]
+usage_totals_ok = True
+for metric in refine.TABLE_METRICS:
+    if abs(usage[metric].sum() - step1["tables"][metric].sum()) > 0.01:
+        usage_totals_ok = False
+check("database_usage: every metric summed, same totals as step 1, every table counted once",
+      usage_totals_ok and usage.n_tables.sum() == len(step1["tables"]))
+pg_unrelated = usage[(usage.label == "PG app") & (usage.schema_name == "appx")].set_index("dss_relation")
+check("database_usage: one row per schema and relation, with its tables",
+      pg_unrelated.loc["DECLARED_UNUSED", "n_tables"] == 1
+      and pg_unrelated.loc["DECLARED_UNUSED", "waste_candidate"] == "YES"
+      and pg_unrelated.loc["STANDALONE", "n_tables"] >= 1)
+check("database_usage: reliability, datasets of the database not located (missing, per_user) and failed projects",
+      set(usage[usage.label == "PG app"].n_datasets_unlocated) == {2}
+      and set(usage[usage.label == "ORA"].n_datasets_unlocated) == {0}
+      and set(usage.n_projects_failed) == {1})
+by_database = usage.groupby(["label", "waste_candidate"]).total_mb.sum()
+check("database_usage: piloted and possible waste per database add up to the database",
+      abs(by_database.loc["ORA"].sum() - step1["tables"][step1["tables"].label == "ORA"].total_mb.sum()) < 0.01)
+three_decimals = True
+for value in usage.total_mb:
+    if value != round(value, 3):
+        three_decimals = False
+check("database_usage: sizes keep 3 decimals", three_decimals)
 
 # PRODUCED wins over MANAGED_IDLE, whatever the project keys
 priority = refine.table_ownership(
@@ -175,9 +229,12 @@ check("storage kind: database, local files, external files, nothing stored",
       and kind[("FOLDER", "FIN", "idle1")] == "EXTERNAL_STORAGE"
       and kind[("DATASET", "SALES", "query_ds")] == "NO_STORAGE", kind)
 oracle_orders = storage.loc[("DATASET", "SALES", "orders_ora")]
-check("database dataset owning its table: the table size, counted",
+orders_table = owned.loc[("ORA", "SALES_DSSWORK", "ORDERS")]
+check("database dataset owning its table: the table size and every metric, counted",
       oracle_orders.size_source == "TABLE" and oracle_orders.counted == "YES"
-      and abs(oracle_orders.size_mb - owned.loc[("ORA", "SALES_DSSWORK", "ORDERS"), "total_mb"]) < 0.001)
+      and abs(oracle_orders.size_mb - orders_table.total_mb) < 0.001
+      and abs(oracle_orders.lob_mb - orders_table.lob_mb) < 0.001
+      and oracle_orders.n_indexes == orders_table.n_indexes and oracle_orders.n_segments == orders_table.n_segments)
 not_owner = storage.loc[("DATASET", "SALES", "orders_clean")]
 check("database dataset whose table another dataset owns: not counted, owner noted",
       not_owner.counted == "NO" and "FIN.dup_writer" in not_owner.note)
@@ -194,6 +251,12 @@ check("use case from the project tags", consumption.loc["SALES", ["use_case", "u
 fin_owned = ownership[(ownership.status == "OWNED") & (ownership.owner_project == "FIN")].total_mb.sum()
 check("database_mb = the tables the project owns", abs(consumption.loc["FIN", "database_mb"] - fin_owned) < 0.01
       and consumption.loc["FIN", "n_owned_tables"] == 2)
+fin_tables = ownership[(ownership.status == "OWNED") & (ownership.owner_project == "FIN")]
+check("project_consumption: every metric of the owned tables",
+      abs(consumption.loc["FIN", "database_other_mb"] - fin_tables.other_mb.sum()) < 0.01
+      and consumption.loc["FIN", "database_n_indexes"] == fin_tables.n_indexes.sum()
+      and consumption.loc["FIN", "database_n_segments"] == fin_tables.n_segments.sum()
+      and consumption.loc["FIN", "database_n_segments"] > 0)
 check("local and external files counted: SALES 4 + 5 MB local, FIN 1 MB external (idle folder)",
       consumption.loc["SALES", "local_storage_mb"] == 9.0 and consumption.loc["SALES", "external_storage_mb"] == 0
       and consumption.loc["FIN", "external_storage_mb"] == 1.0 and consumption.loc["FIN", "idle_mb"] == 1.0)

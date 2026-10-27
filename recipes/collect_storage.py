@@ -18,7 +18,7 @@ import datetime
 
 import dataiku
 
-from dbmon import collect, schemas
+from dbmon import collect, progress, schemas
 
 # Databases read at the same time. 1: one after the other.
 PARALLEL = 4
@@ -43,7 +43,9 @@ if day != today_server and day != today_utc:
 # ---------------------------------------------------------------------------------------
 # Collect
 # ---------------------------------------------------------------------------------------
+progress.log("collect_storage: building the partition %s" % day)
 databases = dataiku.Dataset("databases").get_dataframe()
+progress.log("databases: %d rows read" % len(databases))
 results, log = collect.collect_all(databases, parallel=PARALLEL)
 results["collect_log"] = log
 
@@ -54,13 +56,14 @@ results["collect_log"] = log
 for name in results:
     rows = results[name]
     rows["snapshot_day"] = day
+    progress.log("%s: writing %d rows" % (name, len(rows)))
     written = schemas.write(dataiku.Dataset(name), rows, name)
-    print("%s: %d rows" % (name, len(written)))
+    progress.log("%s: %d rows written" % (name, len(written)))
 
 # ---------------------------------------------------------------------------------------
 # Summary in the job log
 # ---------------------------------------------------------------------------------------
 failed = log[log["status"] == "FAILED"]
-print("%d of %d databases collected" % (len(log) - len(failed), len(log)))
+progress.log("%d of %d databases collected" % (len(log) - len(failed), len(log)))
 for index, failure in failed.iterrows():
-    print("FAILED %s: %s" % (failure["dss_connection"], failure["error"]))
+    progress.log("FAILED %s: %s" % (failure["dss_connection"], failure["error"]))

@@ -7,7 +7,13 @@ This module:
 - runs the SQL files through the admin connection of each database,
 - puts in front of every row: the collection time, the label and environment of the
   database, the DSS connection, and the identity of the database (identity.sql),
+- copies the use case and layer that naming_rules.sql detects from the names: by schema
+  onto objects and tables, by tablespace onto storage_units,
 - sums the objects of each table (tables).
+
+Variants: the engine of a database can be written <engine>-<variant> in databases, e.g.
+oracle-legacy. Each SQL file is then read from sql/oracle-legacy/ when it is there, else
+from sql/oracle/. A variant usually holds only naming_rules.sql, with its own rules.
 """
 import datetime
 import os
@@ -17,13 +23,18 @@ from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 from dataiku import SQLExecutor2
 
+from dbmon import progress
+
 ENGINES = ("oracle", "postgresql")
 
 # SQL files run for each database, after identity.sql
-QUERIES = ("storage_units", "role_settings", "objects")
+QUERIES = ("naming_rules", "storage_units", "role_settings", "objects")
 
 # DataFrames returned for each database
-RESULTS = ("storage_units", "role_settings", "objects", "tables")
+RESULTS = ("naming_rules", "storage_units", "role_settings", "objects", "tables")
+
+# Columns copied from naming_rules
+DETECTED_COLUMNS = ["detected_use_case", "detected_layer"]
 
 # Families of objects (column "family" of objects.sql)
 FAMILIES = ("TABLE", "INDEX", "LOB", "OTHER")
@@ -43,10 +54,37 @@ SESSION_TAG = {
 # One query
 # ---------------------------------------------------------------------------------------
 
+def split_engine(engine):
+    """(base engine, variant) of an engine written <engine> or <engine>-<variant>.
+    The variant is None when there is none. Raises an error for an unknown base engine,
+    or a variant without its folder sql/<engine>-<variant>/."""
+    base = engine
+    variant = None
+    if "-" in engine:
+        base, variant = engine.split("-", 1)
+    if base not in ENGINES:
+        raise ValueError("unknown engine %r, expected one of: %s, or <engine>-<variant>"
+                         % (engine, ", ".join(ENGINES)))
+    if variant is not None and not os.path.isdir(os.path.join(SQL_DIR, engine)):
+        raise ValueError("engine %r: no folder sql/%s/ for its variant" % (engine, engine))
+    return base, variant
+
+
+def sql_file_path(engine, name):
+    """sql/<engine>/<name>.sql. For a variant (oracle-legacy), its own file when the
+    variant folder has one, else the file of the base engine (oracle)."""
+    base, variant = split_engine(engine)
+    if variant is not None:
+        variant_path = os.path.join(SQL_DIR, engine, name + ".sql")
+        if os.path.isfile(variant_path):
+            return variant_path
+    return os.path.join(SQL_DIR, base, name + ".sql")
+
+
 def read_sql(engine, name):
-    """Text of sql/<engine>/<name>.sql as sent to the database: comment lines and the
-    final semicolon removed."""
-    path = os.path.join(SQL_DIR, engine, name + ".sql")
+    """Text of the SQL file of a query, as sent to the database: comment lines and the
+    final semicolon removed. engine can be a variant (see sql_file_path)."""
+    path = sql_file_path(engine, name)
 
     kept_lines = []
     with open(path, encoding="utf-8") as sql_file:
@@ -64,7 +102,8 @@ def read_sql(engine, name):
 def run(connection, engine, name):
     """Result of one SQL file, run in a tagged session. Column names are in lower case."""
     sql = read_sql(engine, name)
-    session_tag = SESSION_TAG[engine] % name
+    base, variant = split_engine(engine)
+    session_tag = SESSION_TAG[base] % name
 
     executor = SQLExecutor2(connection=connection)
     result = executor.query_to_df(sql, pre_queries=[session_tag], infer_from_schema=True)
@@ -78,10 +117,13 @@ def run_and_time(connection, engine, name, timings):
     """Same as run(), and records in timings how many seconds the query took, even when
     it fails."""
     started = time.time()
+    progress.log("%s: %s query started" % (connection, name))
     try:
-        return run(connection, engine, name)
+        rows = run(connection, engine, name)
     finally:
         timings[name] = seconds_since(started)
+    progress.log("%s: %s query done, %d rows in %s s" % (connection, name, len(rows), timings[name]))
+    return rows
 
 
 # ---------------------------------------------------------------------------------------
@@ -93,14 +135,13 @@ def collect(connection, engine, with_objects=True, label=None, environment=None,
     role_settings, plus objects and tables when with_objects is True.
 
     connection    DSS connection with the admin account
-    engine        oracle or postgresql
+    engine        oracle or postgresql, or a variant: oracle-<variant>, postgresql-<variant>
     with_objects  False: tablespaces only
     label         name shown in the reports (default: the connection name)
     environment   PROD, DEV...
     timings       optional dict, filled with the seconds each query took
     """
-    if engine not in ENGINES:
-        raise ValueError("unknown engine %r, expected one of: %s" % (engine, ", ".join(ENGINES)))
+    base, variant = split_engine(engine)
     if label is None:
         label = connection
     if timings is None:
@@ -117,33 +158,56 @@ def collect(connection, engine, with_objects=True, label=None, environment=None,
     first_row = identity.iloc[0]
     for column in identity.columns:
         front_columns[column] = first_row[column]
+    # identity.sql gives the base engine (oracle); the variant (legacy) gets its own column
+    front_columns["sql_variant"] = variant
 
     results = {}
+
+    # Use case and layer detected from the names of the schemas and tablespaces
+    naming_rules = run_and_time(connection, engine, "naming_rules", timings)
+    add_front_columns(naming_rules, front_columns)
+    if base == "postgresql":
+        # PostgreSQL tablespaces belong to the whole cluster, not to one database
+        is_tablespace = naming_rules["name_kind"] == "TABLESPACE"
+        naming_rules.loc[is_tablespace, "database_name"] = None
+    results["naming_rules"] = naming_rules
 
     # Tablespaces
     storage_units = run_and_time(connection, engine, "storage_units", timings)
     add_front_columns(storage_units, front_columns)
-    if engine == "postgresql":
+    if base == "postgresql":
         # PostgreSQL tablespaces belong to the whole cluster, not to one database
         storage_units["database_name"] = None
-    results["storage_units"] = storage_units
+    results["storage_units"] = add_detected(storage_units, naming_rules, "TABLESPACE", "tablespace_name")
 
     # search_path settings of roles and databases (PostgreSQL only, always empty on Oracle)
     role_settings = run_and_time(connection, engine, "role_settings", timings)
     add_front_columns(role_settings, front_columns)
-    if engine == "postgresql":
+    if base == "postgresql":
         # these settings belong to the whole cluster, not to one database
         role_settings["database_name"] = None
     results["role_settings"] = role_settings
 
-    # Objects, and the tables they belong to
+    # Objects, and the tables they belong to. An object gets the rules of its own schema,
+    # a table those of the table's schema.
     if with_objects:
         objects = run_and_time(connection, engine, "objects", timings)
         add_front_columns(objects, front_columns)
-        results["objects"] = objects
-        results["tables"] = tables(objects, list(front_columns))
+        table_rows = tables(objects, list(front_columns))
+        results["objects"] = add_detected(objects, naming_rules, "SCHEMA", "schema_name")
+        results["tables"] = add_detected(table_rows, naming_rules, "SCHEMA", "schema_name")
 
     return results
+
+
+def add_detected(rows, naming_rules, name_kind, name_column):
+    """rows with detected_use_case and detected_layer at the end: those naming_rules gives
+    to the schema or tablespace (name_kind) named in name_column. Empty when it gives none."""
+    rules = naming_rules[naming_rules["name_kind"] == name_kind]
+    rules = rules[["name"] + DETECTED_COLUMNS].drop_duplicates("name")
+    rules = rules.rename(columns={"name": name_column})
+    detected = rows.merge(rules, how="left", on=name_column)
+    return detected
 
 
 def tables(objects, front_columns):
@@ -214,7 +278,7 @@ def collect_all(databases, parallel=4):
     """Collect every database listed in the databases DataFrame, with the columns:
 
     connection   DSS connection with the admin account
-    engine       oracle or postgresql
+    engine       oracle or postgresql, or a variant: oracle-<variant>, postgresql-<variant>
     objects      optional. N: tablespaces only, no objects nor tables (default Y)
     label        optional. Name shown in the reports (default: the connection)
     environment  optional. PROD, DEV...
@@ -225,15 +289,21 @@ def collect_all(databases, parallel=4):
     A database that fails is written in the log and skipped. Raises an error when no
     database could be collected.
     """
+    started = time.time()
     database_rows = list(databases.itertuples(index=False))
 
     workers = int(parallel)
     if workers < 1:
         workers = 1
+    progress.log("Database extraction: %d databases, %d at the same time" % (len(database_rows), workers))
+    counter = progress.Counter(len(database_rows))
+
+    def collect_one(database):
+        return collect_one_database(database, counter)
 
     # Read the databases, up to `workers` at the same time. map() keeps their order.
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        outcomes = list(pool.map(collect_one_database, database_rows))
+        outcomes = list(pool.map(collect_one, database_rows))
 
     # Gather the log entries, and the results of each database by result name
     log_entries = []
@@ -251,6 +321,8 @@ def collect_all(databases, parallel=4):
             frames[name].append(results[name])
 
     log = pd.DataFrame(log_entries)
+    progress.log("Database extraction done: %d of %d databases collected in %s s"
+                 % (collected, len(database_rows), seconds_since(started)))
     if collected == 0:
         raise RuntimeError("no database could be collected:\n%s" % log.to_string())
 
@@ -265,6 +337,8 @@ def collect_all(databases, parallel=4):
     # Every database of a PostgreSQL cluster returns the cluster's tablespaces: keep them once
     stacked["storage_units"] = stacked["storage_units"].drop_duplicates(
         subset=["engine", "server_name", "database_name", "tablespace_name"])
+    stacked["naming_rules"] = stacked["naming_rules"].drop_duplicates(
+        subset=["engine", "server_name", "database_name", "name_kind", "name"])
     # Same for the role settings
     if not stacked["role_settings"].empty:
         stacked["role_settings"] = stacked["role_settings"].drop_duplicates(
@@ -273,9 +347,10 @@ def collect_all(databases, parallel=4):
     return stacked, log
 
 
-def collect_one_database(database):
+def collect_one_database(database, counter=None):
     """Collect one row of the databases DataFrame.
-    Returns (log entry, results), results being None when the database failed."""
+    Returns (log entry, results), results being None when the database failed.
+    counter: progress.Counter of the databases done, for the progress traces."""
     started = time.time()
     connection = database.connection
     engine = database.engine
@@ -295,6 +370,7 @@ def collect_one_database(database):
         "error": None,
     }
 
+    progress.log("database %s (%s, label %s): started" % (connection, engine, label))
     timings = {}
     results = None
     try:
@@ -302,7 +378,6 @@ def collect_one_database(database):
     except Exception as error:
         log_entry["status"] = "FAILED"
         log_entry["error"] = str(error)[:2000]  # first 2000 characters
-        print("FAILED %s: %s" % (connection, error))
 
     if results is not None:
         for name in results:
@@ -311,6 +386,13 @@ def collect_one_database(database):
         log_entry[query_name + "_seconds"] = timings[query_name]
     log_entry["seconds"] = seconds_since(started)
 
+    done = ""
+    if counter is not None:
+        done = " " + counter.next()
+    if results is None:
+        progress.log("database%s %s: FAILED in %s s: %s" % (done, connection, log_entry["seconds"], log_entry["error"]))
+    else:
+        progress.log("database%s %s: OK in %s s" % (done, connection, log_entry["seconds"]))
     return log_entry, results
 
 

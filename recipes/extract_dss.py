@@ -26,7 +26,7 @@ import datetime
 
 import dataiku
 
-from dbmon import dss_extract, schemas
+from dbmon import dss_extract, progress, schemas
 
 # Projects read at the same time. 1: one after the other. Each project is a few admin API
 # calls plus one per dataset and folder (metrics): lower it if the DSS backend is busy.
@@ -47,6 +47,7 @@ if hasattr(dataiku, "dku_flow_variables"):
 # ---------------------------------------------------------------------------------------
 # Read
 # ---------------------------------------------------------------------------------------
+progress.log("extract_dss: building the partition %s" % day)
 client = dataiku.api_client()
 results = dss_extract.extract_dss(client, parallel=PARALLEL, metrics=METRICS)
 
@@ -57,11 +58,12 @@ results = dss_extract.extract_dss(client, parallel=PARALLEL, metrics=METRICS)
 for name in results:
     rows = results[name]
     rows["snapshot_day"] = day
+    progress.log("%s: writing %d rows" % (name, len(rows)))
     written = schemas.write(dataiku.Dataset(name), rows, name)
-    print("%s: %d rows" % (name, len(written)))
+    progress.log("%s: %d rows written" % (name, len(written)))
 
 log = results["inventory_log"]
 failed = log[log["status"] == "FAILED"]
-print("%d of %d projects read" % (len(log) - len(failed), len(log)))
+progress.log("%d of %d projects read" % (len(log) - len(failed), len(log)))
 for index, failure in failed.iterrows():
-    print("FAILED %s: %s" % (failure["project_key"], failure["error"]))
+    progress.log("FAILED %s: %s" % (failure["project_key"], failure["error"]))

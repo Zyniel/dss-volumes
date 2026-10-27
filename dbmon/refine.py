@@ -16,6 +16,8 @@ Results
 - dataset_storage      one row per dataset or managed folder: where its data is, its size,
                        and whether that size goes to its project
 - project_consumption  one row per project: the space it is responsible for
+- database_usage       one row per database, schema and DSS relation: piloted space and
+                       possible waste, for the administrators
 
 dataset_nature: whether the data belongs to the project
   PRODUCED          written by a recipe of the flow                      counts
@@ -28,6 +30,19 @@ storage_kind: where the data is
   LOCAL_STORAGE     files on a Filesystem connection, uploaded files: size from the metrics
   EXTERNAL_STORAGE  anything else (S3, HDFS, other SQL databases...): size from the metrics
   NO_STORAGE        a SQL query dataset: nothing stored
+
+dss_relation: what DSS has to do with a step 1 table (table_ownership, database_usage)
+  PILOTED               owned by a PRODUCED dataset
+  PILOTED_IDLE          owned by MANAGED_IDLE datasets only                  possible waste
+  READ_BY_DSS           only EXTERNAL_SOURCE datasets point to it
+  DECLARED_UNUSED       only EXTERNAL_UNUSED datasets point to it            possible waste
+  UNRELATED_DSS_SCHEMA  no dataset points to it, in a DSS schema             possible waste
+  UNRELATED             no dataset points to it, in another schema
+  STANDALONE            an object of no table (sequence, temporary segment)
+A DSS schema: one whose name follows a naming rule (detected_use_case), or holding a table
+a dataset points to.
+
+Space always comes with every metric of the step 1 tables (TABLE_METRICS).
 
 Candidate schemas of a SQL dataset, in the order the database would use them
 (schema_source):
@@ -42,10 +57,11 @@ Candidate schemas of a SQL dataset, in the order the database would use them
 """
 import json
 import re
+import time
 
 import pandas as pd
 
-from dbmon import use_case
+from dbmon import progress, use_case
 
 # DSS dataset types read as tables of the monitored databases, and their engine
 SQL_DATASET_TYPES = {
@@ -61,7 +77,14 @@ COUNTED_NATURES = ("PRODUCED", "MANAGED_IDLE")
 ORACLE_CURRENT_SCHEMA = re.compile(r"ALTER\s+SESSION\s+SET\s+CURRENT_SCHEMA\s*=\s*\"?([^\"\s;]+)\"?", re.IGNORECASE)
 POSTGRES_SEARCH_PATH = re.compile(r"SET\s+(?:SESSION\s+)?search_path\s*(?:=|TO)\s*(.+?);?\s*$", re.IGNORECASE)
 VARIABLE = re.compile(r"\$\{([^}]+)\}")
-SCHEMA_CONVENTION = re.compile(r"^(.+)_(DSSWORK|DSSOUT)$")
+
+# Metric columns of the step 1 tables: every space figure carries all of them
+TABLE_METRICS = ["total_mb", "table_mb", "index_mb", "lob_mb", "other_mb", "n_indexes", "n_segments"]
+TABLE_IDENTITY = ["label", "engine", "sql_variant", "server_name", "database_name", "schema_name", "table_name",
+                  "standalone"]
+WASTE_RELATIONS = ("PILOTED_IDLE", "DECLARED_UNUSED", "UNRELATED_DSS_SCHEMA")
+# Datasets of a database whose table could not be found: an unrelated table may be theirs
+UNLOCATED_STATUSES = ("NOT_FOUND", "AMBIGUOUS", "PER_USER", "UNRESOLVED")
 
 ROLE_COLUMNS = ["project_key", "object_type", "object_name", "managed", "n_producers", "n_consumers",
                 "n_consuming_projects", "dataset_nature"]
@@ -70,41 +93,85 @@ LOCATION_COLUMNS = ["project_key", "dataset_name", "candidate_rank", "candidate_
                     "schema_name", "table_name", "schema_source", "note"]
 MATCH_COLUMNS = ["project_key", "dataset_name", "match_status", "connection_name", "audit_connection_name",
                  "database_label", "schema_name", "table_name", "candidate_rank", "schema_source", "note"]
-OWNERSHIP_COLUMNS = ["label", "engine", "server_name", "database_name", "schema_name", "table_name", "standalone",
-                     "total_mb", "table_mb", "index_mb", "lob_mb", "other_mb", "status", "owner_project",
-                     "owner_dataset", "owner_nature", "multiple_owners", "n_owning_datasets", "n_source_datasets",
-                     "n_unused_datasets", "n_referencing_projects", "schema_use_case", "schema_layer"]
+OWNERSHIP_COLUMNS = (TABLE_IDENTITY + TABLE_METRICS
+                     + ["detected_use_case", "detected_layer", "status", "owner_project", "owner_dataset",
+                        "owner_nature", "multiple_owners", "n_owning_datasets", "n_source_datasets",
+                        "n_unused_datasets", "n_referencing_projects", "dss_schema", "dss_relation",
+                        "waste_candidate"])
 STORAGE_COLUMNS = ["project_key", "object_type", "object_name", "display_name", "storage_type", "connection",
-                   "dataset_nature", "storage_kind", "size_mb", "size_source", "counted", "note"]
+                   "dataset_nature", "storage_kind", "size_mb", "table_mb", "index_mb", "lob_mb", "other_mb",
+                   "n_indexes", "n_segments", "size_source", "counted", "note"]
+USAGE_KEY = ["label", "engine", "sql_variant", "server_name", "database_name", "schema_name", "dss_schema",
+             "detected_use_case", "detected_layer", "dss_relation", "waste_candidate"]
+USAGE_COLUMNS = USAGE_KEY + ["n_tables"] + TABLE_METRICS + ["n_datasets_unlocated", "n_projects_failed"]
 
 
 def refine(dss, tables, role_settings, databases, connection_mapping):
     """Every result of the refinement. Returns {result name: DataFrame}.
 
-    dss                 {name: DataFrame} of the DSS extraction (dss_projects, dss_datasets...)
+    dss                 {name: DataFrame} of the DSS extraction (dss_projects, dss_datasets...,
+                        and inventory_log: the projects that failed, optional)
     tables              the step 1 tables of the same day
     role_settings       the step 1 role_settings of the same day (can be empty)
     databases           the admin connections and their labels
     connection_mapping  audit_connection_mapping: dss_connection -> audit_connection. None:
                         admin connections only
     """
+    started = time.time()
     datasets = records(dss["dss_datasets"])
     folders = records(dss["dss_managed_folders"])
     links = records(dss["dss_flow_links"])
     projects = records(dss["dss_projects"])
     tags = records(dss["dss_project_tags"])
+    project_log = records(dss.get("inventory_log"))
     table_rows = records(tables)
+    progress.log("Refinement: %d projects, %d datasets, %d folders, %d flow links, %d step 1 tables"
+                 % (len(projects), len(datasets), len(folders), len(links), len(table_rows)))
 
     connection_by_name = {}
     for connection in records(dss["dss_connections"]):
         connection_by_name[connection["connection"]] = connection
 
+    block_started = time.time()
     roles = dataset_roles(datasets, folders, links)
+    log_block("dataset_roles", roles, block_started)
+
+    block_started = time.time()
     locations = dataset_locations(datasets, connection_by_name, databases, connection_mapping, role_settings)
+    log_block("dataset_locations", locations, block_started)
+
+    block_started = time.time()
     matches = dataset_tables(locations, table_rows)
+    n_found = 0
+    for match in matches:
+        if match["match_status"] == "FOUND":
+            n_found = n_found + 1
+    log_block("dataset_tables", matches, block_started, "%d datasets found in step 1" % n_found)
+
+    block_started = time.time()
     ownership = table_ownership(table_rows, matches, roles)
+    n_owned = 0
+    for table in ownership:
+        if table["status"] == "OWNED":
+            n_owned = n_owned + 1
+    log_block("table_ownership", ownership, block_started, "%d tables owned by a project" % n_owned)
+
+    block_started = time.time()
     storage = dataset_storage(datasets, folders, roles, matches, ownership, connection_by_name)
+    log_block("dataset_storage", storage, block_started)
+
+    block_started = time.time()
     consumption = project_consumption(projects, tags, roles, matches, ownership, storage)
+    log_block("project_consumption", consumption, block_started)
+
+    block_started = time.time()
+    usage = database_usage(ownership, matches, project_log)
+    n_waste = 0
+    for group in usage:
+        if group["waste_candidate"] == "YES":
+            n_waste = n_waste + group["n_tables"]
+    log_block("database_usage", usage, block_started, "%d tables possible waste" % n_waste)
+    progress.log("Refinement done in %s s" % round(time.time() - started, 1))
 
     return {
         "dataset_roles": pd.DataFrame(roles, columns=ROLE_COLUMNS),
@@ -113,7 +180,16 @@ def refine(dss, tables, role_settings, databases, connection_mapping):
         "table_ownership": pd.DataFrame(ownership, columns=OWNERSHIP_COLUMNS),
         "dataset_storage": pd.DataFrame(storage, columns=STORAGE_COLUMNS),
         "project_consumption": pd.DataFrame(consumption),
+        "database_usage": pd.DataFrame(usage, columns=USAGE_COLUMNS),
     }
+
+
+def log_block(name, rows, block_started, detail=None):
+    """Progress trace of one result: its rows and seconds, and a detail when given."""
+    message = "%s: %d rows in %s s" % (name, len(rows), round(time.time() - block_started, 1))
+    if detail is not None:
+        message = message + ", " + detail
+    progress.log(message)
 
 
 # ---------------------------------------------------------------------------------------
@@ -493,8 +569,10 @@ def table_ownership(table_rows, matches, roles):
                    project key, then dataset name. multiple_owners = YES when several
     n_owning_datasets, n_source_datasets, n_unused_datasets   datasets pointing to it, by nature
     n_referencing_projects   projects of all those datasets
-    schema_use_case, schema_layer   from the schema name <UC>_DSSWORK / <UC>_DSSOUT (upper
-                   case). Empty outside the convention
+    detected_use_case, detected_layer   as the naming rules of the database detect them
+                   (step 1, naming_rules.sql)
+    dss_schema, dss_relation, waste_candidate   see the module documentation
+    The identity and every metric of the step 1 table are copied.
     """
     nature_by_dataset = {}
     for role in roles:
@@ -531,8 +609,7 @@ def table_ownership(table_rows, matches, roles):
         owners.sort()
 
         row = {}
-        for column in ("label", "engine", "server_name", "database_name", "schema_name", "table_name",
-                       "standalone", "total_mb", "table_mb", "index_mb", "lob_mb", "other_mb"):
+        for column in TABLE_IDENTITY + TABLE_METRICS + ["detected_use_case", "detected_layer"]:
             row[column] = table.get(column)
 
         if owners:
@@ -557,15 +634,36 @@ def table_ownership(table_rows, matches, roles):
         row["n_source_datasets"] = n_source
         row["n_unused_datasets"] = n_unused
         row["n_referencing_projects"] = len(projects)
-
-        row["schema_use_case"] = None
-        row["schema_layer"] = None
-        convention = SCHEMA_CONVENTION.match(upper(table["schema_name"]) or "")
-        if convention:
-            row["schema_use_case"] = convention.group(1)
-            row["schema_layer"] = convention.group(2)
         rows.append(row)
+
+    # DSS schemas: named by a naming rule, or holding a table a dataset points to
+    dss_schemas = set()
+    for row in rows:
+        if row["detected_use_case"] is not None or row["status"] != "UNREFERENCED":
+            dss_schemas.add((row["label"], row["schema_name"]))
+
+    for row in rows:
+        row["dss_schema"] = yes_no((row["label"], row["schema_name"]) in dss_schemas)
+        row["dss_relation"] = dss_relation(row)
+        row["waste_candidate"] = yes_no(row["dss_relation"] in WASTE_RELATIONS)
     return rows
+
+
+def dss_relation(row):
+    """What DSS has to do with a table of table_ownership (see the module documentation)."""
+    if row.get("standalone") == "YES":
+        return "STANDALONE"
+    if row["status"] == "OWNED":
+        if row["owner_nature"] == "PRODUCED":
+            return "PILOTED"
+        return "PILOTED_IDLE"
+    if row["status"] == "READ_ONLY":
+        return "READ_BY_DSS"
+    if row["status"] == "UNUSED":
+        return "DECLARED_UNUSED"
+    if row["dss_schema"] == "YES":
+        return "UNRELATED_DSS_SCHEMA"
+    return "UNRELATED"
 
 
 def owner_sort_key(project_key, dataset_name, nature):
@@ -584,6 +682,8 @@ def dataset_storage(datasets, folders, roles, matches, ownership, connection_by_
     """Rows of dataset_storage, datasets first, then managed folders.
 
     size_mb       DATABASE: the total of its step 1 table. Otherwise: the size metric
+    table_mb, index_mb, lob_mb, other_mb, n_indexes, n_segments
+                  DATABASE: the other metrics of its step 1 table. Otherwise empty
     size_source   TABLE, METRIC, or NONE when unknown
     counted       YES when the size goes to the project: a LOCAL or EXTERNAL object of a
                   counted nature, or the owner of a DATABASE table (table_ownership)
@@ -615,6 +715,8 @@ def dataset_storage(datasets, folders, roles, matches, ownership, connection_by_
             "dataset_nature": nature_by_object.get(("DATASET", project_key, name)),
             "storage_kind": dataset_storage_kind(dataset, connection_type),
             "size_mb": None,
+            "table_mb": None, "index_mb": None, "lob_mb": None, "other_mb": None,
+            "n_indexes": None, "n_segments": None,
             "size_source": "NONE",
             "counted": "NO",
             "note": None,
@@ -673,6 +775,9 @@ def database_size(row, match, table_by_key):
     if table is None:
         return
     row["size_mb"] = table.get("total_mb")
+    for metric in TABLE_METRICS:
+        if metric != "total_mb":
+            row[metric] = table.get(metric)
     row["size_source"] = "TABLE"
     owner = (table.get("owner_project"), table.get("owner_dataset"))
     if owner == (row["project_key"], row["object_name"]):
@@ -701,7 +806,8 @@ def project_consumption(projects, tags, roles, matches, ownership, storage):
 
     use_case, use_case_source   from the project tags (TAG, RULE or NONE)
     n_*                         its datasets and folders, by nature; datasets found or not
-    database_mb (and table, index, lob)  its owned tables (table_ownership)
+    database_mb, database_table_mb, database_index_mb, database_lob_mb, database_other_mb,
+    database_n_indexes, database_n_segments   every metric of its owned tables (table_ownership)
     local_storage_mb, external_storage_mb   its counted files (dataset_storage)
     total_mb                    database_mb + local_storage_mb + external_storage_mb
     idle_mb                     part of total_mb held by MANAGED_IDLE objects (written by no
@@ -740,6 +846,9 @@ def project_consumption(projects, tags, roles, matches, ownership, storage):
             "database_table_mb": 0.0,
             "database_index_mb": 0.0,
             "database_lob_mb": 0.0,
+            "database_other_mb": 0.0,
+            "database_n_indexes": 0,
+            "database_n_segments": 0,
             "local_storage_mb": 0.0,
             "external_storage_mb": 0.0,
             "total_mb": 0.0,
@@ -785,6 +894,9 @@ def project_consumption(projects, tags, roles, matches, ownership, storage):
         row["database_table_mb"] = row["database_table_mb"] + number(table.get("table_mb"))
         row["database_index_mb"] = row["database_index_mb"] + number(table.get("index_mb"))
         row["database_lob_mb"] = row["database_lob_mb"] + number(table.get("lob_mb"))
+        row["database_other_mb"] = row["database_other_mb"] + number(table.get("other_mb"))
+        row["database_n_indexes"] = row["database_n_indexes"] + int(number(table.get("n_indexes")))
+        row["database_n_segments"] = row["database_n_segments"] + int(number(table.get("n_segments")))
 
     for item in storage:
         row = row_by_project.get(item["project_key"])
@@ -831,6 +943,67 @@ def project_consumption(projects, tags, roles, matches, ownership, storage):
         for column in row:
             if column.endswith("_mb"):
                 row[column] = round(row[column], 3)
+    return rows
+
+
+# ---------------------------------------------------------------------------------------
+# database_usage: piloted space and possible waste, per database and schema
+# ---------------------------------------------------------------------------------------
+
+def database_usage(ownership, matches, project_log):
+    """Rows of database_usage: the tables of table_ownership grouped by database, schema and
+    dss_relation, with their count and every metric of the step 1 tables summed.
+
+    n_datasets_unlocated  datasets on that database whose table could not be found
+                          (NOT_FOUND, AMBIGUOUS, PER_USER, UNRESOLVED)
+    n_projects_failed     projects the DSS extraction could not read
+    When either is above 0, a table counted UNRELATED may belong to one of them: the
+    unrelated figures are then an upper bound.
+    """
+    unlocated_by_label = {}
+    for match in matches:
+        if match["match_status"] not in UNLOCATED_STATUSES:
+            continue
+        label = match.get("database_label")
+        unlocated_by_label[label] = unlocated_by_label.get(label, 0) + 1
+
+    n_projects_failed = 0
+    for entry in project_log:
+        if entry.get("status") == "FAILED":
+            n_projects_failed = n_projects_failed + 1
+
+    groups = {}
+    group_order = []
+    for table in ownership:
+        key = []
+        for column in USAGE_KEY:
+            key.append(table.get(column))
+        key = tuple(key)
+        if key not in groups:
+            group = {}
+            for column in USAGE_KEY:
+                group[column] = table.get(column)
+            group["n_tables"] = 0
+            for metric in TABLE_METRICS:
+                group[metric] = 0.0
+            groups[key] = group
+            group_order.append(key)
+        group = groups[key]
+        group["n_tables"] = group["n_tables"] + 1
+        for metric in TABLE_METRICS:
+            group[metric] = group[metric] + number(table.get(metric))
+
+    rows = []
+    for key in group_order:
+        group = groups[key]
+        for metric in TABLE_METRICS:
+            if metric.endswith("_mb"):
+                group[metric] = round(group[metric], 3)  # sums of decimals: keep 3 decimals
+            else:
+                group[metric] = int(group[metric])
+        group["n_datasets_unlocated"] = unlocated_by_label.get(group["label"], 0)
+        group["n_projects_failed"] = n_projects_failed
+        rows.append(group)
     return rows
 
 

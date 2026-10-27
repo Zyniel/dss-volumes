@@ -3,8 +3,10 @@
     python tests/test_collect.py
 """
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 
 sys.dont_write_bytecode = True
 import pandas as pd
@@ -79,7 +81,7 @@ check("objects empty: Y", by_connection.loc["ADM_ORA", "objects"] == "Y")
 
 front = ["collected_utc", "label", "environment", "dss_connection", "engine", "server_name", "database_name",
          "unique_name", "role", "version"]
-check("results: storage_units, role_settings, objects, tables", list(results) == list(collect.RESULTS))
+check("results: naming_rules, storage_units, role_settings, objects, tables", list(results) == list(collect.RESULTS))
 for name in results:
     check("%s: identity columns in front" % name, list(results[name].columns[:len(front)]) == front)
 for name in collect.QUERIES:
@@ -159,6 +161,92 @@ check("Oracle: ORDERS with its LOB and indexes, in DATA and INDEX tablespaces",
 pg_tables = tables[tables.dss_connection == "ADM_PG_APP"].set_index(["schema_name", "table_name"])
 check("PostgreSQL: the sequence is a standalone row",
       pg_tables.loc[("appx", "seq1"), "standalone"] == "YES" and pg_tables.loc[("appx", "seq1"), "other_mb"] > 0)
+
+# --- naming rules: use case and layer detected in the databases --------------------------------
+rules = results["naming_rules"]
+ora_rules = rules[rules.engine == "oracle"].set_index(["name_kind", "name"])
+check("naming_rules on Oracle: schema <UC>_DSSWORK, tablespace <UC>_DSSOUT_<suffix>, others empty",
+      ora_rules.loc[("SCHEMA", "SALES_DSSWORK"), ["detected_use_case", "detected_layer"]].tolist() == ["SALES", "DSSWORK"]
+      and ora_rules.loc[("TABLESPACE", "SALES_DSSOUT_DATA"), ["detected_use_case", "detected_layer"]].tolist()
+      == ["SALES", "DSSOUT"]
+      and ora_rules.loc[("SCHEMA", "APPX"), ["detected_use_case", "detected_layer"]].isna().all()
+      and ora_rules.loc[("TABLESPACE", "USERS"), ["detected_use_case", "detected_layer"]].isna().all(),
+      ora_rules.to_string())
+pg_rules = rules[rules.engine == "postgresql"]
+pg_tablespace_rules = pg_rules[pg_rules.name_kind == "TABLESPACE"]
+check("naming_rules on PostgreSQL: tablespaces once per cluster, without database_name",
+      sorted(pg_tablespace_rules.name) == ["pg_default", "pg_global", "sales_dsswork_index"]
+      and pg_tablespace_rules.database_name.isna().all())
+check("naming_rules on PostgreSQL: schemas per database",
+      set(pg_rules[(pg_rules.name_kind == "SCHEMA") & (pg_rules.database_name == "otherdb")].name)
+      >= {"sales_dsswork", "public"})
+
+
+def detected(rows):
+    values = []
+    for value in rows.iloc[0][["detected_use_case", "detected_layer"]]:
+        if value is None or pd.isna(value):
+            values.append(None)
+        else:
+            values.append(value)
+    return values
+
+
+check("storage_units: detected from the tablespace name",
+      detected(ora_storage.loc[["SALES_DSSWORK_INDEX"]]) == ["SALES", "DSSWORK"]
+      and detected(pg_storage.loc[["sales_dsswork_index"]]) == ["SALES", "DSSWORK"]
+      and detected(pg_storage.loc[["pg_default"]]) == [None, None])
+check("objects: detected from the object's schema",
+      detected(ora_objects[ora_objects.object_name == "ORDERS_AMOUNT_IX"]) == ["SALES", "DSSWORK"]
+      and detected(pg_objects[pg_objects.schema_name == "appx"]) == [None, None])
+check("tables: detected from the table's schema",
+      detected(pg_tables.loc[[("fin_dssout", "ledger")]]) == ["FIN", "DSSOUT"]
+      and detected(ora_tables.loc[["ORDERS"]]) == ["SALES", "DSSWORK"])
+check("same rows with and without the rules: objects and tables not duplicated",
+      len(objects) == len(collect.run("ADM_PG_APP", "postgresql", "objects"))
+      + len(collect.run("ADM_ORA", "oracle", "objects")))
+check("sql_variant empty without variant", results["tables"].sql_variant.isna().all())
+
+# --- variants: oracle-legacy has its own naming rules, the other files come from oracle --------
+scratch_sql = tempfile.mkdtemp(prefix="dbmon_sql_")
+shutil.rmtree(scratch_sql)
+shutil.copytree(os.path.join(REPO, "dbmon", "sql"), scratch_sql)
+os.mkdir(os.path.join(scratch_sql, "oracle-legacy"))
+with open(sql_path("oracle", "naming_rules"), encoding="utf-8") as sql_file:
+    legacy_rules = sql_file.read()
+# the legacy rule: schema APPX is the use case LEGACY, layer APP
+legacy_rules = legacy_rules.replace("REGEXP_SUBSTR(UPPER(n.name), n.pattern, 1, 1, NULL, 1)",
+                                    "CASE WHEN n.name = 'APPX' THEN 'LEGACY' "
+                                    "ELSE REGEXP_SUBSTR(UPPER(n.name), n.pattern, 1, 1, NULL, 1) END")
+legacy_rules = legacy_rules.replace("REGEXP_SUBSTR(UPPER(n.name), n.pattern, 1, 1, NULL, 2)",
+                                    "CASE WHEN n.name = 'APPX' THEN 'APP' "
+                                    "ELSE REGEXP_SUBSTR(UPPER(n.name), n.pattern, 1, 1, NULL, 2) END")
+with open(os.path.join(scratch_sql, "oracle-legacy", "naming_rules.sql"), "w", encoding="utf-8") as sql_file:
+    sql_file.write(legacy_rules)
+collect.SQL_DIR = scratch_sql
+try:
+    check("variant: its own file when it has one, the base engine's file otherwise",
+          collect.sql_file_path("oracle-legacy", "naming_rules").endswith(os.path.join("oracle-legacy", "naming_rules.sql"))
+          and collect.sql_file_path("oracle-legacy", "objects").endswith(os.path.join("oracle", "objects.sql")))
+    legacy, legacy_log = collect.collect_all(pd.DataFrame([("ADM_ORA", "oracle-legacy", "ORA legacy")],
+                                                          columns=["connection", "engine", "label"]), parallel=1)
+    legacy_tables = legacy["tables"].set_index(["schema_name", "table_name"])
+    check("variant: collected, engine oracle, sql_variant legacy",
+          legacy_log.status.tolist() == ["OK"] and set(legacy["tables"].engine) == {"oracle"}
+          and set(legacy["tables"].sql_variant) == {"legacy"})
+    check("variant: its rules applied (APPX = LEGACY / APP), the default rules kept for the rest",
+          detected(legacy_tables.loc[[("APPX", "NOTES")]]) == ["LEGACY", "APP"]
+          and detected(legacy_tables.loc[[("SALES_DSSWORK", "ORDERS")]]) == ["SALES", "DSSWORK"])
+    check("variant: same storage as the base engine",
+          abs(legacy["tables"].total_mb.sum() - tables[tables.engine == "oracle"].total_mb.sum()) < 0.01)
+    try:
+        collect.split_engine("oracle-nothing")
+        check("variant without its folder rejected", False)
+    except ValueError as error:
+        check("variant without its folder rejected", "oracle-nothing" in str(error))
+finally:
+    collect.SQL_DIR = os.path.join(REPO, "dbmon", "sql")
+    shutil.rmtree(scratch_sql)
 
 # --- role_settings ---------------------------------------------------------------------------
 settings = results["role_settings"]

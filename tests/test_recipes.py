@@ -55,8 +55,9 @@ today = datetime.datetime.now(datetime.timezone.utc).astimezone().date().isoform
 INPUTS["databases"] = pd.DataFrame([("ADM_PG_APP", "postgresql", "PG app"), ("ADM_PG_DOWN", "postgresql", None)],
                                    columns=["connection", "engine", "label"])
 printed = run_recipe("collect_storage.py", {"DKU_DST_snapshot_day": today})
-check("collect: the five outputs written",
-      sorted(WRITTEN) == ["collect_log", "objects", "role_settings", "storage_units", "tables"], sorted(WRITTEN))
+check("collect: the six outputs written",
+      sorted(WRITTEN) == ["collect_log", "naming_rules", "objects", "role_settings", "storage_units", "tables"],
+      sorted(WRITTEN))
 all_start_with_day = True
 for name in WRITTEN:
     rows = WRITTEN[name]
@@ -139,8 +140,8 @@ check("extract: every output written with its declared schema and the day", extr
 extracted = dict(WRITTEN)
 
 # --- refine_inventory ------------------------------------------------------------------------
-REFINE_OUTPUTS = ["dataset_locations", "dataset_roles", "dataset_storage", "dataset_tables", "project_consumption",
-                  "table_ownership"]
+REFINE_OUTPUTS = ["database_usage", "dataset_locations", "dataset_roles", "dataset_storage", "dataset_tables",
+                  "project_consumption", "table_ownership"]
 INPUTS["databases"] = DATABASES
 INPUTS["audit_connection_mapping"] = CONNECTION_MAPPING
 INPUTS["tables"] = pg_run_tables
@@ -148,7 +149,7 @@ INPUTS["role_settings"] = pg_run_settings
 for name in extracted:
     INPUTS[name] = extracted[name]
 run_recipe("refine_inventory.py", {"DKU_DST_snapshot_day": today})
-check("refine: the six outputs written", sorted(WRITTEN) == REFINE_OUTPUTS, sorted(WRITTEN))
+check("refine: the seven outputs written", sorted(WRITTEN) == REFINE_OUTPUTS, sorted(WRITTEN))
 refine_declared = True
 for name in WRITTEN:
     if schema_columns(name) != declared_columns(name):
