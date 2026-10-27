@@ -218,6 +218,14 @@ check("datasets and folders by nature",
       == [2, 1, 1, 1] and consumption.loc["FIN", "n_datasets_not_found"] == 1)
 check("no counted object without size here", consumption.n_size_unknown.sum() == 0)
 
+three_decimals = True
+for column in consumption.columns:
+    if column.endswith("_mb"):
+        for value in consumption[column]:
+            if value != round(value, 3):
+                three_decimals = False
+check("sizes summed in project_consumption keep 3 decimals", three_decimals)
+
 total_owned = consumption.database_mb.sum()
 not_owned = ownership[ownership.status != "OWNED"].total_mb.sum()
 check("owned by projects + not owned = all the space of step 1 tables",

@@ -824,8 +824,13 @@ def project_consumption(projects, tags, roles, matches, ownership, storage):
         elif table.get("owner_project") != project_key:
             row["database_read_mb"] = row["database_read_mb"] + size
 
+    # Sums of decimal numbers carry tiny binary errors (1.1880000000000002): keep 3 decimals,
+    # like the sizes they add up
     for row in rows:
         row["total_mb"] = row["database_mb"] + row["local_storage_mb"] + row["external_storage_mb"]
+        for column in row:
+            if column.endswith("_mb"):
+                row[column] = round(row[column], 3)
     return rows
 
 
