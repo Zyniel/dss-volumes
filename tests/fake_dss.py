@@ -1,12 +1,16 @@
 """A stand-in for the DSS public API client (dataikuapi), returning the structures of DSS 13.4.4,
 with three projects:
 
-SALES   use case SALES. raw_orders (source) -> compute_clean -> orders_clean, orders_ora
-        (targets); orders_clean is shared with FIN. Orphans covering every location case;
-        old_copy points to a table no other dataset uses (NO_FLOW).
-FIN     reads SALES.orders_clean -> join -> fin_summary -> copy -> dup_writer, which writes
-        the same table as SALES.orders_clean (two owners). Schema from a project variable.
+SALES   use case SALES. raw_orders (source) -> compute_clean -> orders_clean, orders_ora,
+        local_out and the folder "exports" (all produced); orders_clean is shared with FIN.
+        Unmanaged orphans covering every location case; old_copy points to a table no other
+        dataset uses (UNUSED).
+FIN     reads SALES.orders_clean and lake_input (S3) -> join -> fin_summary -> copy ->
+        dup_writer, which writes the same table as SALES.orders_clean (two owners). Schema
+        from a project variable. A managed folder written by no recipe (idle).
 BROKEN  its flow graph cannot be read: the project fails.
+
+Every API call is counted in CALLS, so that the tests can check how many are made.
 """
 import pandas as pd
 
@@ -28,6 +32,12 @@ CONNECTION_MAPPING = pd.DataFrame([
     ("ORA_LOST", "ADM_NOT_LISTED"),
 ], columns=["dss_connection", "audit_connection"])
 
+CALLS = {}
+
+
+def count(call_name):
+    CALLS[call_name] = CALLS.get(call_name, 0) + 1
+
 
 def dataset(name, dataset_type, connection=None, schema="", table="", mode="table", managed=False,
             path=None, dimensions=()):
@@ -41,6 +51,10 @@ def dataset(name, dataset_type, connection=None, schema="", table="", mode="tabl
             "partitioning": {"dimensions": partition_dimensions}}
 
 
+def folder(folder_id, name, folder_type, connection, path):
+    return {"id": folder_id, "name": name, "type": folder_type, "params": {"connection": connection, "path": path}}
+
+
 def metric(metric_id, values_by_partition):
     last_values = []
     for partition in values_by_partition:
@@ -49,7 +63,7 @@ def metric(metric_id, values_by_partition):
 
 
 def node(node_type, ref, predecessors=(), successors=(), project_key=None):
-    # as on DSS: the graph does not say the recipe type, the recipe settings do
+    # as on DSS: the graph does not say the recipe type, the recipe list does
     result = {"type": node_type, "ref": ref, "predecessors": list(predecessors), "successors": list(successors)}
     if project_key is not None:
         result["projectKey"] = project_key
@@ -73,46 +87,60 @@ PROJECTS = {
             dataset("elsewhere", "PostgreSQL", "PG_UNMAPPED", "public", "t"),
             dataset("old_copy", "PostgreSQL", "PG_SALES", "appx", "mv_totals"),
             dataset("via_url", "Oracle", "ORA_URL", "", "LEDGER"),
+            dataset("local_out", "Filesystem", "filesystem_managed", path="${projectKey}/local_out", managed=True),
         ],
+        "folders": [folder("folder1", "exports", "Filesystem", "filesystem_managed", "${projectKey}/exports")],
         "recipes": {"compute_clean": "python"},
         "metrics": {
             "raw_orders": [metric("records:COUNT_RECORDS", {"NP": 3000})],
             "orders_clean": [metric("records:COUNT_RECORDS", {"NP": 0})],
             "orders_ora": [metric("records:COUNT_RECORDS", {"2026-10-01": 10, "2026-10-02": 5})],
+            "notes_file": [metric("basic:SIZE", {"NP": 1048576})],
+            "local_out": [metric("basic:SIZE", {"NP": 4194304})],
+            "folder1": [metric("basic:SIZE", {"NP": 5242880}), metric("basic:COUNT_FILES", {"NP": 3})],
         },
         "graph": {
             "raw_orders": node("COMPUTABLE_DATASET", "raw_orders", successors=["compute_clean"]),
             "compute_clean": node("RUNNABLE_RECIPE", "compute_clean", ["raw_orders"],
-                                  ["orders_clean", "orders_ora", "folder1"]),
+                                  ["orders_clean", "orders_ora", "local_out", "folder1"]),
             "orders_clean": node("COMPUTABLE_DATASET", "orders_clean", ["compute_clean"]),
             "orders_ora": node("COMPUTABLE_DATASET", "orders_ora", ["compute_clean"]),
+            "local_out": node("COMPUTABLE_DATASET", "local_out", ["compute_clean"]),
             "folder1": node("COMPUTABLE_FOLDER", "folder1", ["compute_clean"]),
         },
     },
     "FIN": {
-        "tags": ["finance"],
+        "tags": ["finance", "CDP-Domain:Finance"],
         "variables": {"standard": {"finSchema": "wrong"}, "local": {"finSchema": "fin_dssout"}},
         "exposed": {"objects": []},
         "datasets": [
             dataset("fin_summary", "PostgreSQL", "PG_SALES", "${finSchema}", "ledger", managed=True),
             dataset("missing", "PostgreSQL", "PG_SALES", "appx", "nope"),
             dataset("dup_writer", "PostgreSQL", "PG_SALES", "sales_dssout", "SALES_orders", managed=True),
+            dataset("lake_input", "S3", "s3_lake", path="/lake/fin"),
         ],
+        "folders": [folder("idle1", "old drops", "S3", "s3_lake", "/drops")],
         "recipes": {"join": "join", "copy": "sync"},
-        "metrics": {"fin_summary": [metric("basic:SIZE", {"NP": 2097152})]},
+        "metrics": {
+            "fin_summary": [metric("basic:SIZE", {"NP": 2097152})],
+            "lake_input": [metric("basic:SIZE", {"NP": 10485760})],
+            "idle1": [metric("basic:SIZE", {"NP": 1048576})],
+        },
         "graph": {
             "SALES.orders_clean": node("COMPUTABLE_DATASET", "SALES.orders_clean", successors=["join"],
                                        project_key="SALES"),
-            "join": node("RUNNABLE_RECIPE", "join", ["SALES.orders_clean"], ["fin_summary"]),
+            "lake_input": node("COMPUTABLE_DATASET", "lake_input", successors=["join"]),
+            "join": node("RUNNABLE_RECIPE", "join", ["SALES.orders_clean", "lake_input"], ["fin_summary"]),
             "fin_summary": node("COMPUTABLE_DATASET", "fin_summary", ["join"], ["copy"]),
             "copy": node("RUNNABLE_RECIPE", "copy", ["fin_summary"], ["dup_writer"]),
             "dup_writer": node("COMPUTABLE_DATASET", "dup_writer", ["copy"]),
         },
     },
     "BROKEN": {"tags": [], "variables": {"standard": {}, "local": {}}, "exposed": {"objects": []},
-               "datasets": [], "recipes": {}, "metrics": {}, "graph": None},
+               "datasets": [], "folders": [], "recipes": {}, "metrics": {}, "graph": None},
 }
 
+# Connection details, as get_connection(name).get_info() returns them (resolved)
 CONNECTIONS = {
     "PG_SALES": {"type": "PostgreSQL", "credentialsMode": "GLOBAL",
                  "resolvedParams": {"host": "pg", "port": 5432, "db": "appdb", "user": "dbmon",
@@ -136,7 +164,47 @@ CONNECTIONS = {
     "PG_HOST_URL": {"type": "PostgreSQL", "credentialsMode": "GLOBAL",
                     "resolvedParams": {"host": "jdbc:postgresql://pg:5432/appdb?ssl=true&password=p1", "user": "dbmon"}},
     "filesystem_managed": {"type": "Filesystem", "resolvedParams": {"root": "/data/managed"}},
+    "s3_lake": {"type": "EC2", "resolvedParams": {"bucket": "lake"}},
 }
+
+# Permissions of the connections, as list_connections() returns them. The others: usable by
+# the groups listed (none), details readable by nobody.
+PERMISSIONS = {
+    "PG_SALES": {"usableBy": "ALLOWED", "allowedGroups": ["data_team", "sales"],
+                 "detailsReadability": {"readableBy": "ALLOWED", "allowedGroups": ["data_team"]}},
+    "PG_POSTCONNECT": {"usableBy": "ALL", "allowedGroups": [],
+                       "detailsReadability": {"readableBy": "NONE", "allowedGroups": []}},
+}
+
+
+def listed_connection(name):
+    """A connection as list_connections() returns it: the parameters before resolution.
+    PG_SALES has a variable in its host and its user in a credential: its details are read.
+    PG_PERUSER has no user: its details are read. The others are used as listed."""
+    details = CONNECTIONS[name]
+    params = dict(details["resolvedParams"])
+    if name == "PG_SALES":
+        params["host"] = "${pgHost}"
+        del params["user"]
+    definition = {"name": name, "type": details["type"], "params": params,
+                  "usableBy": "ALLOWED", "allowedGroups": [], "detailsReadability": {"readableBy": "NONE"}}
+    if "credentialsMode" in details:
+        definition["credentialsMode"] = details["credentialsMode"]
+    definition.update(PERMISSIONS.get(name, {}))
+    return definition
+
+
+USERS = [
+    {"login": "alice", "displayName": "Alice", "email": "alice@example.com", "sourceType": "LOCAL", "enabled": True,
+     "userProfile": "DESIGNER", "groups": ["data_team", "sales"]},
+    {"login": "bob", "displayName": "Bob", "email": "bob@example.com", "sourceType": "LDAP", "enabled": False,
+     "userProfile": "READER", "groups": ["sales"]},
+]
+GROUPS = [
+    {"name": "data_team", "description": "Data team", "sourceType": "LOCAL", "admin": False},
+    {"name": "sales", "description": "Sales", "sourceType": "LDAP", "admin": False},
+    {"name": "administrators", "description": "DSS admins", "sourceType": "LOCAL", "admin": True},
+]
 
 
 class Handle(object):
@@ -152,6 +220,7 @@ class FakeProject(object):
         self.definition = PROJECTS[project_key]
 
     def list_datasets(self):
+        count("list_datasets")
         items = []
         for definition in self.definition["datasets"]:
             raw = dict(definition)
@@ -159,50 +228,89 @@ class FakeProject(object):
             items.append(Handle(_data=raw))
         return items
 
+    def list_recipes(self):
+        count("list_recipes")
+        items = []
+        for recipe_name in self.definition["recipes"]:
+            raw = {"name": recipe_name, "type": self.definition["recipes"][recipe_name], "projectKey": self.project_key}
+            items.append(Handle(_data=raw))
+        return items
+
+    def list_managed_folders(self):
+        count("list_managed_folders")
+        items = []
+        for definition in self.definition["folders"]:
+            items.append(dict(definition))
+        return items
+
     def get_variables(self):
+        count("get_variables")
         return self.definition["variables"]
 
     def get_settings(self):
+        count("get_settings")
         raw = {"exposedObjects": self.definition["exposed"]}
         return Handle(get_raw=lambda: raw)
 
     def get_flow(self):
+        count("get_flow")
         if self.definition["graph"] is None:
             raise Exception("flow graph not readable")
         graph = Handle(data={"nodes": self.definition["graph"]})
         return Handle(get_graph=lambda: graph)
 
     def get_recipe(self, recipe_name):
-        # DSSRecipe.get_settings().type is the "type" field of the recipe's JSON definition
-        recipe_type = self.definition["recipes"][recipe_name]
-        settings = Handle(type=recipe_type, recipe_settings={"type": recipe_type})
-        return Handle(get_settings=lambda: settings)
+        count("get_recipe")
+        raise Exception("the recipe types come from list_recipes")
+
+    def metrics_of(self, object_name):
+        count("get_last_metric_values")
+        raw = {"metrics": self.definition["metrics"].get(object_name, [])}
+        return Handle(get_raw=lambda: raw)
 
     def get_dataset(self, dataset_name):
-        raw = {"metrics": self.definition["metrics"].get(dataset_name, [])}
-        computed = Handle(get_raw=lambda: raw)
-        return Handle(get_last_metric_values=lambda partition="": computed)
+        return Handle(get_last_metric_values=lambda partition="": self.metrics_of(dataset_name))
+
+    def get_managed_folder(self, folder_id):
+        return Handle(get_last_metric_values=lambda: self.metrics_of(folder_id))
 
 
 class FakeClient(object):
     def list_projects(self):
+        count("list_projects")
         projects = []
         for project_key in PROJECTS:
-            projects.append({"projectKey": project_key, "tags": PROJECTS[project_key]["tags"]})
+            projects.append({"projectKey": project_key, "name": project_key.title() + " project",
+                             "ownerLogin": "alice", "tags": PROJECTS[project_key]["tags"]})
         return projects
 
     def get_project(self, project_key):
         return FakeProject(project_key)
 
     def get_global_variables(self):
+        count("get_global_variables")
         return {"instanceVar": "x"}
 
     def list_connections(self, as_type="dictitems"):
-        names = {}
+        count("list_connections")
+        listed = {}
         for name in CONNECTIONS:
-            names[name] = None
-        return names
+            listed[name] = listed_connection(name)
+        return listed
 
     def get_connection(self, name):
         info = CONNECTIONS[name]
-        return Handle(get_info=lambda contextual_project_key=None: info)
+
+        def get_info(contextual_project_key=None):
+            count("get_connection_info")
+            return info
+
+        return Handle(get_info=get_info)
+
+    def list_users(self):
+        count("list_users")
+        return USERS
+
+    def list_groups(self):
+        count("list_groups")
+        return GROUPS

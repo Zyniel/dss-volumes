@@ -5,9 +5,9 @@ Run against two local test databases in Docker. No DSS is needed: `harness.py` s
 ```
 python tests/setup_containers.py     # start the containers, load the test data (safe to run again)
 python tests/test_collect.py         # step 1: SQL files and dbmon.collect, both engines
-python tests/test_inventory.py       # step 2: dbmon.inventory
-python tests/test_analysis.py        # step 3: the Oracle SQL recipes, in a scratch schema DBMON_STORE
-python tests/test_recipes.py         # the two recipe files, run as DSS would
+python tests/test_extract.py         # step 2: dbmon.dss_extract (no database needed)
+python tests/test_refine.py          # step 3: dbmon.refine, on step 1 data collected from the containers
+python tests/test_recipes.py         # the three recipe files, run as DSS would
 ```
 
 Each test prints one line per check (`ok` or `FAIL`) and exits with 1 when a check fails.

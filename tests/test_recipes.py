@@ -1,4 +1,4 @@
-"""The two recipe files, run as DSS would, with datasets kept in memory.
+"""The three recipe files, run as DSS would, with datasets kept in memory.
 
     python tests/test_recipes.py
 """
@@ -34,9 +34,6 @@ class FakeDataset(object):
 
     def write_dataframe(self, rows):
         WRITTEN[self.name] = rows.copy()
-
-    def get_location_info(self):
-        raise Exception("not an input of this recipe")
 
 
 def run_recipe(file_name, flow_variables):
@@ -125,32 +122,58 @@ try:
 except ValueError as error:
     check("an undeclared column stops the write with its name", "new_column" in str(error))
 
-# --- inventory_dss ---------------------------------------------------------------------------
+# --- extract_dss -----------------------------------------------------------------------------
+INPUTS.clear()
+printed = run_recipe("extract_dss.py", {"DKU_DST_snapshot_day": today})
+EXTRACT_OUTPUTS = ["dss_connection_permissions", "dss_connections", "dss_dataset_shares", "dss_datasets",
+                   "dss_flow_links", "dss_group_members", "dss_groups", "dss_managed_folders", "dss_project_tags",
+                   "dss_projects", "dss_users", "inventory_log"]
+check("extract: no input read, the twelve outputs written", sorted(WRITTEN) == EXTRACT_OUTPUTS, sorted(WRITTEN))
+check("extract: summary with the failed project", "2 of 3 projects read" in printed and "FAILED BROKEN" in printed,
+      printed)
+extract_declared = True
+for name in WRITTEN:
+    if schema_columns(name) != declared_columns(name) or not (WRITTEN[name].snapshot_day == today).all():
+        extract_declared = False
+check("extract: every output written with its declared schema and the day", extract_declared)
+extracted = dict(WRITTEN)
+
+# --- refine_inventory ------------------------------------------------------------------------
+REFINE_OUTPUTS = ["dataset_locations", "dataset_roles", "dataset_storage", "dataset_tables", "project_consumption",
+                  "table_ownership"]
 INPUTS["databases"] = DATABASES
 INPUTS["audit_connection_mapping"] = CONNECTION_MAPPING
+INPUTS["tables"] = pg_run_tables
 INPUTS["role_settings"] = pg_run_settings
-printed = run_recipe("inventory_dss.py", {"DKU_DST_snapshot_day": today})
-INVENTORY_OUTPUTS = ["dss_connections", "dss_dataset_locations", "dss_dataset_shares", "dss_datasets", "dss_flow_links",
-                     "dss_projects", "inventory_log"]
-check("inventory: the seven outputs written", sorted(WRITTEN) == INVENTORY_OUTPUTS, sorted(WRITTEN))
-check("inventory: summary with the failed project", "2 of 3 projects read" in printed and "FAILED BROKEN" in printed,
-      printed)
-inventory_declared = True
+for name in extracted:
+    INPUTS[name] = extracted[name]
+run_recipe("refine_inventory.py", {"DKU_DST_snapshot_day": today})
+check("refine: the six outputs written", sorted(WRITTEN) == REFINE_OUTPUTS, sorted(WRITTEN))
+refine_declared = True
 for name in WRITTEN:
     if schema_columns(name) != declared_columns(name):
-        inventory_declared = False
-check("inventory: every output written with its declared schema", inventory_declared)
-locations = WRITTEN["dss_dataset_locations"]
-raw_orders = locations[locations.dataset_name == "raw_orders"]
-check("inventory: DSS location not readable, candidates from the settings, noted",
-      raw_orders.schema_source.iloc[0] == "SEARCH_PATH" and "DSS location not readable" in raw_orders.note.iloc[0])
+        refine_declared = False
+check("refine: every output written with its declared schema", refine_declared)
+tables_found = WRITTEN["dataset_tables"].set_index(["project_key", "dataset_name"])
+check("refine: datasets matched to the tables read back from the datasets",
+      tables_found.loc[("SALES", "raw_orders"), "match_status"] == "FOUND")
 
-# Empty role_settings (first run, or Oracle only): the inventory still runs, default search_path
+# An older day in the inputs is ignored
+older = extracted["dss_datasets"].copy()
+older["snapshot_day"] = "2000-01-01"
+older["dataset_name"] = older["dataset_name"] + "_old"
+INPUTS["dss_datasets"] = pd.concat([older, extracted["dss_datasets"]], ignore_index=True)
+run_recipe("refine_inventory.py", {"DKU_DST_snapshot_day": today})
+check("refine: only the latest day of the inputs is used",
+      not WRITTEN["dataset_storage"].object_name.str.endswith("_old").any())
+
+# Empty role_settings (first run, or Oracle only): the refinement still runs, default search_path
+INPUTS["dss_datasets"] = extracted["dss_datasets"]
 INPUTS["role_settings"] = schemas.conform(pd.DataFrame(), "role_settings")
-run_recipe("inventory_dss.py", {"DKU_DST_snapshot_day": today})
-locations = WRITTEN["dss_dataset_locations"]
-check("inventory with empty role_settings: runs, PostgreSQL default search_path \"$user\", public",
-      sorted(WRITTEN) == INVENTORY_OUTPUTS
+run_recipe("refine_inventory.py", {"DKU_DST_snapshot_day": today})
+locations = WRITTEN["dataset_locations"]
+check("refine with empty role_settings: runs, PostgreSQL default search_path \"$user\", public",
+      sorted(WRITTEN) == REFINE_OUTPUTS
       and locations[locations.dataset_name == "raw_orders"].schema_name.tolist() == ["dbmon", "public"])
 
 finish()
