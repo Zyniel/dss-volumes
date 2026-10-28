@@ -19,9 +19,11 @@ step1, step1_log = collect.collect_all(DATABASES[["connection", "engine", "label
 check("step 1 collected on both engines", (step1_log.status == "OK").all(), step1_log.to_string())
 step2 = dss_extract.extract_dss(FakeClient(), parallel=2)
 
-results = refine.refine(step2, step1["tables"], step1["role_settings"], DATABASES, CONNECTION_MAPPING)
+results = refine.refine(step2, step1["tables"], step1["role_settings"], DATABASES, CONNECTION_MAPPING,
+                        step1["naming_rules"])
 check("outputs", sorted(results) == ["database_usage", "dataset_locations", "dataset_roles", "dataset_storage",
-                                    "dataset_tables", "project_consumption", "table_ownership"], sorted(results))
+                                    "dataset_tables", "project_consumption", "schema_usage", "table_ownership"],
+      sorted(results))
 all_declared = True
 for name in results:
     try:
@@ -293,5 +295,74 @@ total_owned = consumption.database_mb.sum()
 not_owned = ownership[ownership.status != "OWNED"].total_mb.sum()
 check("owned by projects + not owned = all the space of step 1 tables",
       abs(total_owned + not_owned - step1["tables"].total_mb.sum()) < 0.01)
+
+# --- schema_usage: one line per schema ----------------------------------------------------------
+schema_lines = results["schema_usage"]
+lines = schema_lines.set_index(["label", "schema_name"])
+rule_schemas = step1["naming_rules"][step1["naming_rules"].name_kind == "SCHEMA"]
+check("schema_usage: one line per schema of every database, the empty ones included",
+      len(schema_lines) == len(rule_schemas) and not lines.index.duplicated().any()
+      and lines.loc[("PG app", "public"), "n_tables"] == 0 and lines.loc[("ORA", "DBMON"), "n_tables"] == 0)
+empty = lines.loc[("PG app", "public")]
+check("schema without table: 0 MB, % empty",
+      empty.total_mb == 0 and pd.isna(empty.piloted_pct) and pd.isna(empty.waste_pct) and empty.dss_schema == "NO")
+totals_ok = True
+for metric in refine.TABLE_METRICS:
+    if abs(schema_lines[metric].sum() - step1["tables"][metric].sum()) > 0.01:
+        totals_ok = False
+check("schema_usage: every metric of the tables, same totals as step 1", totals_ok
+      and schema_lines.n_tables.sum() == len(step1["tables"]))
+dssout = lines.loc[("ORA", "SALES_DSSOUT")]
+dssout_tables = ownership[(ownership.label == "ORA") & (ownership.schema_name == "SALES_DSSOUT")]
+unused_mb = dssout_tables[dssout_tables.dss_relation == "DECLARED_UNUSED"].total_mb.sum()
+check("schema_usage: MB and % of a relation, of the schema's space",
+      abs(dssout.declared_unused_total_mb - unused_mb) < 0.001
+      and abs(dssout.declared_unused_pct - round(unused_mb * 100 / dssout.total_mb, 2)) < 0.001
+      and dssout.declared_unused_n_tables == 1 and dssout.detected_use_case == "SALES",
+      dssout[["total_mb", "declared_unused_total_mb", "declared_unused_pct"]].to_string())
+check("schema_usage: waste summary",
+      abs(dssout.waste_total_mb - dssout.total_mb) < 0.001 and dssout.waste_pct == 100)
+check("schema_usage: dss_related = every table a dataset points to, whatever its relation",
+      lines.loc[("PG app", "sales_dsswork"), "dss_related_pct"] == 100
+      and lines.loc[("PG app", "sales_dsswork"), "read_by_dss_pct"] == 100
+      and lines.loc[("PG app", "appx"), "dss_related_pct"] == 50
+      and abs(dssout.dss_related_total_mb - dssout.declared_unused_total_mb) < 0.001
+      and lines.loc[("ORA", "SALES_DSSWORK"), "dss_related_pct"] == lines.loc[("ORA", "SALES_DSSWORK"), "piloted_pct"])
+pct_columns = []
+mb_columns = []
+for relation in refine.DSS_RELATIONS:
+    pct_columns.append(relation.lower() + "_pct")
+    mb_columns.append(relation.lower() + "_total_mb")
+with_space = schema_lines[schema_lines.total_mb > 0]
+check("schema_usage: the % of a schema add up to 100, the MB to its total",
+      ((with_space[pct_columns].sum(axis=1) - 100).abs() < 0.05).all()
+      and ((with_space[mb_columns].sum(axis=1) - with_space.total_mb).abs() < 0.002).all())
+group_metrics_ok = True
+for group_name, relations in (("declared_unused", ["DECLARED_UNUSED"]),
+                              ("dss_related", ["PILOTED", "PILOTED_IDLE", "READ_BY_DSS", "DECLARED_UNUSED"]),
+                              ("waste", ["PILOTED_IDLE", "DECLARED_UNUSED", "UNRELATED_DSS_SCHEMA"])):
+    group_tables = dssout_tables[dssout_tables.dss_relation.isin(relations)]
+    if dssout[group_name + "_n_tables"] != len(group_tables):
+        group_metrics_ok = False
+    for metric in refine.TABLE_METRICS:
+        if abs(dssout[group_name + "_" + metric] - group_tables[metric].sum()) > 0.001:
+            group_metrics_ok = False
+check("schema_usage: every metric of the tables per relation and per cumulated group, with its table count",
+      group_metrics_ok and dssout.waste_n_tables == 4 and dssout.dss_related_n_tables == 1)
+for metric in refine.TABLE_METRICS:
+    per_relation = []
+    for relation in refine.DSS_RELATIONS:
+        per_relation.append(relation.lower() + "_" + metric)
+    if ((with_space[per_relation].sum(axis=1) - with_space[metric]).abs() > 0.002).any():
+        group_metrics_ok = False
+check("schema_usage: the relations of a schema add up to the schema, metric by metric", group_metrics_ok)
+check("schema_usage: every relation has its columns, in the declared schema",
+      list(schema_lines.columns) == refine.SCHEMA_USAGE_COLUMNS
+      and len(schemas.conform(schema_lines, "schema_usage")) == len(schema_lines))
+check("schema_usage: reliability counts of the database",
+      lines.loc[("PG app", "public"), "n_datasets_unlocated"] == 2 and set(schema_lines.n_projects_failed) == {1})
+without_rules = refine.refine(step2, step1["tables"], step1["role_settings"], DATABASES, CONNECTION_MAPPING)
+check("without naming_rules: the schemas holding tables only",
+      len(without_rules["schema_usage"]) == len(step1["tables"].drop_duplicates(["label", "schema_name"])))
 
 finish()

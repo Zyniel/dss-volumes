@@ -77,6 +77,7 @@ run_recipe("collect_storage.py", None)
 check("collect: not partitioned, today in snapshot_day", (WRITTEN["objects"].snapshot_day == today).all())
 pg_run_tables = WRITTEN["tables"]
 pg_run_settings = WRITTEN["role_settings"]
+pg_run_naming_rules = WRITTEN["naming_rules"]
 
 
 def schema_columns(dataset_name):
@@ -141,15 +142,16 @@ extracted = dict(WRITTEN)
 
 # --- refine_inventory ------------------------------------------------------------------------
 REFINE_OUTPUTS = ["database_usage", "dataset_locations", "dataset_roles", "dataset_storage", "dataset_tables",
-                  "project_consumption", "table_ownership"]
+                  "project_consumption", "schema_usage", "table_ownership"]
 INPUTS["databases"] = DATABASES
 INPUTS["audit_connection_mapping"] = CONNECTION_MAPPING
 INPUTS["tables"] = pg_run_tables
 INPUTS["role_settings"] = pg_run_settings
+INPUTS["naming_rules"] = pg_run_naming_rules
 for name in extracted:
     INPUTS[name] = extracted[name]
 run_recipe("refine_inventory.py", {"DKU_DST_snapshot_day": today})
-check("refine: the seven outputs written", sorted(WRITTEN) == REFINE_OUTPUTS, sorted(WRITTEN))
+check("refine: the eight outputs written", sorted(WRITTEN) == REFINE_OUTPUTS, sorted(WRITTEN))
 refine_declared = True
 for name in WRITTEN:
     if schema_columns(name) != declared_columns(name):

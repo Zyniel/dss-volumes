@@ -16,7 +16,7 @@ DSS API              ─► 2 DSS extraction      (Python, DSS API) ─► dss_p
 1 + 2 + databases
 + audit_connection_mapping ─► 3 Refinement     (Python, no API)  ─► dataset_roles, dataset_locations, dataset_tables,
                                                                     table_ownership, dataset_storage, project_consumption,
-                                                                    database_usage
+                                                                    database_usage, schema_usage
 ```
 
 Steps 1 and 2 do not depend on each other: they can run first, in any order. Step 3 only reads datasets.
@@ -179,7 +179,7 @@ API calls: one per run for the projects, connections, users, groups and instance
 ### Set up
 
 1. Create the dataset `audit_connection_mapping`, one row per DSS connection used by datasets: `dss_connection` (that connection) and `audit_connection` (the admin connection of `databases` whose step 1 export holds its tables). That is how a dataset is tied to a monitored database: its connection leads to the admin connection, and that one to its `label` in `databases`. Admin connections used directly by datasets need no row. A connection mapped to several admin connections gets its candidates once per database.
-2. Create a Python recipe with `databases`, `audit_connection_mapping`, `tables`, `role_settings`, `dss_projects`, `dss_project_tags`, `dss_datasets`, `dss_managed_folders`, `dss_flow_links`, `dss_connections` and `inventory_log` as inputs, and the seven datasets below as outputs. Paste [recipes/refine_inventory.py](recipes/refine_inventory.py). Partition the outputs by day; partition dependency "Equals" on the partitioned inputs (the recipe keeps their latest day if it reads more).
+2. Create a Python recipe with `databases`, `audit_connection_mapping`, `tables`, `role_settings`, `naming_rules`, `dss_projects`, `dss_project_tags`, `dss_datasets`, `dss_managed_folders`, `dss_flow_links`, `dss_connections` and `inventory_log` as inputs, and the eight datasets below as outputs. Paste [recipes/refine_inventory.py](recipes/refine_inventory.py). Partition the outputs by day; partition dependency "Equals" on the partitioned inputs (the recipe keeps their latest day if it reads more).
 3. Build it in the scenario after steps 1 and 2.
 
 ### Nature and storage of a dataset
@@ -213,6 +213,7 @@ And where its data is:
 | `dataset_storage` | dataset or managed folder | `dataset_nature`, `storage_kind`, `size_mb`; for a `DATABASE` dataset also `table_mb`, `index_mb`, `lob_mb`, `other_mb`, `n_indexes`, `n_segments` of its table; `size_source` (`TABLE`, `METRIC`, `NONE`), `counted` (YES when the size goes to the project), `note` |
 | `project_consumption` | project | `use_case`, `use_case_source`; datasets and folders by nature, found or not; `database_mb`, `database_table_mb`, `database_index_mb`, `database_lob_mb`, `database_other_mb`, `database_n_indexes`, `database_n_segments` (every metric of its owned tables), `local_storage_mb`, `external_storage_mb`, `total_mb` (the three sizes summed), `idle_mb` (part held by `MANAGED_IDLE` objects); `database_read_mb`, `database_unused_mb`, `external_read_mb`; `n_size_unknown` |
 | `database_usage` | database, schema and `dss_relation` | `dss_schema`, `detected_use_case`, `detected_layer`, `waste_candidate`, `n_tables` and every metric of `tables` summed; `n_datasets_unlocated`, `n_projects_failed` (see [below](#piloted-space-and-possible-waste)) |
+| `schema_usage` | schema of every database, the empty ones included | the schema's identity, `dss_schema`, `detected_use_case`, `detected_layer`; `n_tables` and every metric of `tables` summed; then for each group: `<group>_n_tables`, `<group>_total_mb`, `<group>_table_mb`, `<group>_index_mb`, `<group>_lob_mb`, `<group>_other_mb`, `<group>_n_indexes`, `<group>_n_segments`, `<group>_pct` (% of the schema's `total_mb`). Groups: one per `dss_relation`, then `dss_related` (the tables a DSS dataset points to, whatever its role: `PILOTED`, `PILOTED_IDLE`, `READ_BY_DSS`, `DECLARED_UNUSED`) and `waste` (the waste candidates); `n_datasets_unlocated`, `n_projects_failed` |
 
 ### Candidate locations
 
@@ -259,6 +260,8 @@ For the administrators: what DSS pilots in each database, and what may be wasted
 A DSS schema (`dss_schema = YES`) is one whose name follows a naming rule, or that holds a table a dataset points to.
 
 Reliability: a table can look unrelated only because the dataset pointing to it could not be located. Each row of `database_usage` gives `n_datasets_unlocated` (datasets on that database whose table was not found: `NOT_FOUND`, `AMBIGUOUS`, `PER_USER`, `UNRESOLVED`) and `n_projects_failed` (projects the DSS extraction could not read). When either is above 0, the unrelated figures are an upper bound. Datasets whose connection is not mapped (`UNMAPPED`) belong to no database: see `dataset_tables`.
+
+`schema_usage` gives the same figures on one line per schema, to compare each relation with the schema's space. Each relation is a group of columns prefixed by its name in lower case (`piloted_`, `piloted_idle_`, `read_by_dss_`, `declared_unused_`, `unrelated_dss_schema_`, `unrelated_`, `standalone_`), followed by the two cumulated groups `dss_related_` and `waste_`. Every group has its table count and every metric of `tables`, always present, even at 0. The relations of a schema add up to the schema, metric by metric, and their `_pct` to 100; the `_pct` are empty for a schema without space. A table counts in its relation and, when it applies, in `dss_related` and in `waste`. Every schema the naming rules list is there, even without table: filter afterwards.
 
 ## Use case of a project
 

@@ -18,6 +18,8 @@ Results
 - project_consumption  one row per project: the space it is responsible for
 - database_usage       one row per database, schema and DSS relation: piloted space and
                        possible waste, for the administrators
+- schema_usage         one row per schema of every database, even empty: its space and how
+                       it splits by DSS relation, in MB and in % of the schema
 
 dataset_nature: whether the data belongs to the project
   PRODUCED          written by a recipe of the flow                      counts
@@ -105,8 +107,47 @@ USAGE_KEY = ["label", "engine", "sql_variant", "server_name", "database_name", "
              "detected_use_case", "detected_layer", "dss_relation", "waste_candidate"]
 USAGE_COLUMNS = USAGE_KEY + ["n_tables"] + TABLE_METRICS + ["n_datasets_unlocated", "n_projects_failed"]
 
+# Every dss_relation, in the order of the schema_usage columns
+DSS_RELATIONS = ["PILOTED", "PILOTED_IDLE", "READ_BY_DSS", "DECLARED_UNUSED", "UNRELATED_DSS_SCHEMA", "UNRELATED",
+                 "STANDALONE"]
+# Relations where at least one DSS dataset points to the table
+RELATED_RELATIONS = ("PILOTED", "PILOTED_IDLE", "READ_BY_DSS", "DECLARED_UNUSED")
+SCHEMA_IDENTITY = ["label", "engine", "sql_variant", "server_name", "database_name", "schema_name"]
 
-def refine(dss, tables, role_settings, databases, connection_mapping):
+# Groups of tables in schema_usage, each one a prefix of its columns: one per dss_relation,
+# then two cumulated ones
+SCHEMA_GROUPS = ["piloted", "piloted_idle", "read_by_dss", "declared_unused", "unrelated_dss_schema", "unrelated",
+                 "standalone", "dss_related", "waste"]
+
+
+def schema_groups_of(relation):
+    """Prefixes of the schema_usage groups a table of this dss_relation counts in: its
+    relation, dss_related when a dataset points to it, waste when it is a waste candidate."""
+    groups = [relation.lower()]
+    if relation in RELATED_RELATIONS:
+        groups.append("dss_related")
+    if relation in WASTE_RELATIONS:
+        groups.append("waste")
+    return groups
+
+
+def schema_usage_columns():
+    """Columns of schema_usage: identity, schema totals, then for each group its tables,
+    every metric of the step 1 tables, and its share of the schema's space."""
+    columns = SCHEMA_IDENTITY + ["dss_schema", "detected_use_case", "detected_layer", "n_tables"] + TABLE_METRICS
+    for group in SCHEMA_GROUPS:
+        columns.append(group + "_n_tables")
+        for metric in TABLE_METRICS:
+            columns.append(group + "_" + metric)
+        columns.append(group + "_pct")
+    columns = columns + ["n_datasets_unlocated", "n_projects_failed"]
+    return columns
+
+
+SCHEMA_USAGE_COLUMNS = schema_usage_columns()
+
+
+def refine(dss, tables, role_settings, databases, connection_mapping, naming_rules=None):
     """Every result of the refinement. Returns {result name: DataFrame}.
 
     dss                 {name: DataFrame} of the DSS extraction (dss_projects, dss_datasets...,
@@ -116,6 +157,9 @@ def refine(dss, tables, role_settings, databases, connection_mapping):
     databases           the admin connections and their labels
     connection_mapping  audit_connection_mapping: dss_connection -> audit_connection. None:
                         admin connections only
+    naming_rules        the step 1 naming_rules of the same day: every schema of every
+                        database, so that schema_usage lists the empty ones too. None: the
+                        schemas holding tables only
     """
     started = time.time()
     datasets = records(dss["dss_datasets"])
@@ -171,6 +215,14 @@ def refine(dss, tables, role_settings, databases, connection_mapping):
         if group["waste_candidate"] == "YES":
             n_waste = n_waste + group["n_tables"]
     log_block("database_usage", usage, block_started, "%d tables possible waste" % n_waste)
+
+    block_started = time.time()
+    schemas = schema_usage(ownership, records(naming_rules), matches, project_log)
+    n_empty = 0
+    for schema in schemas:
+        if schema["n_tables"] == 0:
+            n_empty = n_empty + 1
+    log_block("schema_usage", schemas, block_started, "%d schemas without table" % n_empty)
     progress.log("Refinement done in %s s" % round(time.time() - started, 1))
 
     return {
@@ -181,6 +233,7 @@ def refine(dss, tables, role_settings, databases, connection_mapping):
         "dataset_storage": pd.DataFrame(storage, columns=STORAGE_COLUMNS),
         "project_consumption": pd.DataFrame(consumption),
         "database_usage": pd.DataFrame(usage, columns=USAGE_COLUMNS),
+        "schema_usage": pd.DataFrame(schemas, columns=SCHEMA_USAGE_COLUMNS),
     }
 
 
@@ -960,17 +1013,8 @@ def database_usage(ownership, matches, project_log):
     When either is above 0, a table counted UNRELATED may belong to one of them: the
     unrelated figures are then an upper bound.
     """
-    unlocated_by_label = {}
-    for match in matches:
-        if match["match_status"] not in UNLOCATED_STATUSES:
-            continue
-        label = match.get("database_label")
-        unlocated_by_label[label] = unlocated_by_label.get(label, 0) + 1
-
-    n_projects_failed = 0
-    for entry in project_log:
-        if entry.get("status") == "FAILED":
-            n_projects_failed = n_projects_failed + 1
+    unlocated_by_label = unlocated_datasets(matches)
+    n_projects_failed = failed_projects(project_log)
 
     groups = {}
     group_order = []
@@ -1005,6 +1049,136 @@ def database_usage(ownership, matches, project_log):
         group["n_projects_failed"] = n_projects_failed
         rows.append(group)
     return rows
+
+
+def unlocated_datasets(matches):
+    """{database label: datasets whose table could not be found on it}."""
+    unlocated_by_label = {}
+    for match in matches:
+        if match["match_status"] not in UNLOCATED_STATUSES:
+            continue
+        label = match.get("database_label")
+        unlocated_by_label[label] = unlocated_by_label.get(label, 0) + 1
+    return unlocated_by_label
+
+
+def failed_projects(project_log):
+    """Projects the DSS extraction could not read."""
+    n_projects_failed = 0
+    for entry in project_log:
+        if entry.get("status") == "FAILED":
+            n_projects_failed = n_projects_failed + 1
+    return n_projects_failed
+
+
+# ---------------------------------------------------------------------------------------
+# schema_usage: one line per schema, its space split by dss_relation
+# ---------------------------------------------------------------------------------------
+
+def schema_usage(ownership, naming_rule_rows, matches, project_log):
+    """Rows of schema_usage: one per schema of every database, the schemas without table
+    included (from naming_rules), to filter afterwards.
+
+    n_tables, total_mb ... n_segments   the schema: every metric of its tables summed
+    For each group (SCHEMA_GROUPS), its columns prefixed by its name:
+      <group>_n_tables                    its tables
+      <group>_total_mb ... <group>_n_segments   every metric of those tables summed
+      <group>_pct                         <group>_total_mb in % of the schema's total_mb (0 to
+                                          100, 2 decimals). Empty when the schema holds 0 MB
+    Groups: one per dss_relation (piloted ... standalone), whose % add up to 100, then
+      dss_related   the tables a DSS dataset points to, whatever its role: PILOTED,
+                    PILOTED_IDLE, READ_BY_DSS, DECLARED_UNUSED
+      waste         the waste candidates: PILOTED_IDLE, DECLARED_UNUSED, UNRELATED_DSS_SCHEMA
+    n_datasets_unlocated, n_projects_failed   reliability, as in database_usage
+    The space of a schema is the space of its tables: an index owned by another schema
+    counts with its table, as in the step 1 tables.
+    """
+    unlocated_by_label = unlocated_datasets(matches)
+    n_projects_failed = failed_projects(project_log)
+
+    schemas = {}
+    schema_order = []
+
+    # Every schema the naming rules list, with its detected use case and layer
+    for rule in naming_rule_rows:
+        if rule.get("name_kind") != "SCHEMA":
+            continue
+        key = (rule.get("label"), rule.get("name"))
+        if key in schemas:
+            continue
+        schema = new_schema_row(rule, rule.get("name"))
+        schemas[key] = schema
+        schema_order.append(key)
+
+    # The tables, added to their schema (a schema missing from the naming rules is added)
+    for table in ownership:
+        key = (table.get("label"), table.get("schema_name"))
+        if key not in schemas:
+            schema = new_schema_row(table, table.get("schema_name"))
+            schemas[key] = schema
+            schema_order.append(key)
+        schema = schemas[key]
+        schema["n_tables"] = schema["n_tables"] + 1
+        if table.get("dss_schema") == "YES":
+            schema["dss_schema"] = "YES"
+        for metric in TABLE_METRICS:
+            schema[metric] = schema[metric] + number(table.get(metric))
+        for group in schema_groups_of(table["dss_relation"]):
+            schema[group + "_n_tables"] = schema[group + "_n_tables"] + 1
+            for metric in TABLE_METRICS:
+                column = group + "_" + metric
+                schema[column] = schema[column] + number(table.get(metric))
+
+    rows = []
+    for key in schema_order:
+        schema = schemas[key]
+        # sums of decimals: keep 3 decimals
+        round_metrics(schema, "")
+        for group in SCHEMA_GROUPS:
+            round_metrics(schema, group + "_")
+            schema[group + "_pct"] = percent_of(schema[group + "_total_mb"], schema["total_mb"])
+        schema["n_datasets_unlocated"] = unlocated_by_label.get(schema["label"], 0)
+        schema["n_projects_failed"] = n_projects_failed
+        rows.append(schema)
+    return rows
+
+
+def new_schema_row(source, schema_name):
+    """An empty row of schema_usage, its identity copied from a naming rule or a table."""
+    schema = {}
+    for column in SCHEMA_IDENTITY:
+        schema[column] = source.get(column)
+    schema["schema_name"] = schema_name
+    schema["detected_use_case"] = source.get("detected_use_case")
+    schema["detected_layer"] = source.get("detected_layer")
+    # a schema named by a rule is a DSS schema; one holding a table a dataset points to too
+    schema["dss_schema"] = yes_no(schema["detected_use_case"] is not None)
+    schema["n_tables"] = 0
+    for metric in TABLE_METRICS:
+        schema[metric] = 0.0
+    for group in SCHEMA_GROUPS:
+        schema[group + "_n_tables"] = 0
+        for metric in TABLE_METRICS:
+            schema[group + "_" + metric] = 0.0
+        schema[group + "_pct"] = None
+    return schema
+
+
+def round_metrics(row, prefix):
+    """The metrics prefix + TABLE_METRICS of row: MB kept with 3 decimals, counts whole."""
+    for metric in TABLE_METRICS:
+        column = prefix + metric
+        if metric.endswith("_mb"):
+            row[column] = round(row[column], 3)
+        else:
+            row[column] = int(row[column])
+
+
+def percent_of(part, whole):
+    """part in % of whole, 2 decimals. None when whole is 0."""
+    if whole == 0:
+        return None
+    return round(part * 100.0 / whole, 2)
 
 
 # ---------------------------------------------------------------------------------------

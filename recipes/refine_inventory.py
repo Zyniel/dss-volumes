@@ -7,7 +7,7 @@
 #         audit_connection_mapping  one row per DSS connection used by datasets: dss_connection,
 #                                   and audit_connection, the admin connection of databases
 #                                   that exports its tables
-#         tables, role_settings     from collect_storage
+#         tables, role_settings, naming_rules   from collect_storage
 #         dss_projects, dss_project_tags, dss_datasets, dss_managed_folders, dss_flow_links,
 #         dss_connections, inventory_log   from extract_dss
 # Outputs dataset_roles             one row per dataset or folder: writers, readers, nature
@@ -18,6 +18,8 @@
 #         project_consumption       one row per project: the space it is responsible for
 #         database_usage            one row per database, schema and DSS relation: piloted
 #                                   space and possible waste
+#         schema_usage              one row per schema of every database, even empty: its
+#                                   space split by DSS relation, in MB and %
 #
 # The partitioned inputs are read for the day of the run (the most recent day they hold when
 # the recipe reads more than one).
@@ -66,11 +68,12 @@ databases = read_input("databases", False)
 connection_mapping = read_input("audit_connection_mapping", False)
 tables = read_input("tables", True)
 role_settings = read_input("role_settings", True)
+naming_rules = read_input("naming_rules", True)
 dss = {}
 for name in DSS_INPUTS:
     dss[name] = read_input(name, True)
 
-results = refine.refine(dss, tables, role_settings, databases, connection_mapping)
+results = refine.refine(dss, tables, role_settings, databases, connection_mapping, naming_rules)
 
 # ---------------------------------------------------------------------------------------
 # Write, every row starting with the day of the run. Every output gets its declared schema
