@@ -214,19 +214,24 @@ def get_admin_client(instance_name):
 
 local = FakeClient()
 instance_rows = [
-    {"instance_name": "DESIGN"},
-    {"instance_name": " AUTOMATION "},
-    {"instance_name": float("nan")},
-    {"instance_name": "NO_SUCH"},
-    {"instance_name": "DOWN"},
+    {"instance_name": "DESIGN", "instance_location": "local"},
+    {"instance_name": " AUTOMATION ", "instance_location": "Remote"},
+    {"instance_name": float("nan"), "instance_location": "remote"},
+    {"instance_name": "NO_SUCH", "instance_location": "remote"},
+    {"instance_name": "DOWN", "instance_location": "remote"},
+    {"instance_name": "NOWHERE", "instance_location": float("nan")},
+    {"instance_name": "LOCAL_AGAIN", "instance_location": "LOCAL"},
 ]
 instances = dss_extract.connect_instances(instance_rows, get_admin_client, local)
 by_name = {}
 for instance in instances:
     by_name[instance["name"]] = instance
-check("instances: one client per instance_name through the admin client library, empty names skipped",
-      asked == ["DESIGN", "AUTOMATION", "NO_SUCH", "DOWN"] and "client" in by_name["AUTOMATION"]
-      and by_name["DESIGN"]["client"] is not local, asked)
+check("instances: local = the instance the recipe runs on, remote = through the admin client library",
+      by_name["DESIGN"]["client"] is local and asked == ["AUTOMATION", "NO_SUCH", "DOWN"]
+      and "client" in by_name["AUTOMATION"], asked)
+check("instances: empty names skipped, location without value or second local instance refused",
+      len(instances) == 6 and "local or remote" in by_name["NOWHERE"]["error"]
+      and "second local" in by_name["LOCAL_AGAIN"]["error"])
 check("instances: a client that cannot be made is an error of that instance only",
       "unknown instance" in by_name["NO_SUCH"]["error"] and "client" in by_name["DOWN"])
 check("instances: no row = the local instance, named local",
@@ -238,7 +243,8 @@ check("several instances: every output starts with dss_instance",
 instance_log = several["inventory_log"]
 failed_instances = instance_log[instance_log.project_key.isna()]
 check("several instances: an instance that cannot be read is one FAILED row, the others are read",
-      sorted(failed_instances.dss_instance) == ["DOWN", "NO_SUCH"] and set(failed_instances.status) == {"FAILED"}
+      sorted(failed_instances.dss_instance) == ["DOWN", "LOCAL_AGAIN", "NOWHERE", "NO_SUCH"]
+      and set(failed_instances.status) == {"FAILED"}
       and "connection refused" in failed_instances.set_index("dss_instance").loc["DOWN", "error"])
 sales = several["dss_projects"][several["dss_projects"].project_key == "SALES"]
 check("several instances: the same project key on two instances is two projects",

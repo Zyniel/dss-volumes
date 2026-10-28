@@ -5,9 +5,11 @@
 # the database extraction (collect_storage): both can run first.
 #
 # Input   instances                   one row per DSS instance to read (Design, Automation
-#                                     nodes... writing to the monitored databases), with at
-#                                     least instance_name: copied in dss_instance, and given to
-#                                     com.arval.cdplib.client.get_remote_admin_client.
+#                                     nodes... writing to the monitored databases):
+#                                       instance_name      copied in dss_instance
+#                                       instance_location  local: this instance (dataiku.api_client())
+#                                                          remote: another one, through
+#                                                          com.arval.cdplib.client.get_remote_admin_client
 #                                     No row: this instance only, named "local".
 # Outputs dss_projects                one row per project
 #         dss_project_tags            one row per project and tag

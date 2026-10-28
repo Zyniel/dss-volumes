@@ -149,12 +149,19 @@ On Oracle, a table without any segment is listed too, at 0 MB with `n_segments =
 
 ### Set up
 
-1. Create an editable dataset `instances`, one row per DSS instance to read, with at least the column `instance_name` (`DESIGN`, `AUTOMATION`...). Each name is copied on every row as `dss_instance`, and given to `com.arval.cdplib.client.get_remote_admin_client` (a library of the environment) for the admin client of that instance. No row: the instance the recipe runs on only, named `local`.
+1. Create an editable dataset `instances`, one row per DSS instance to read:
+
+   | Column | |
+   |---|---|
+   | `instance_name` | its name, copied on every row as `dss_instance` (`DESIGN`, `AUTOMATION`...) |
+   | `instance_location` | `local`: the instance the recipe runs on, read through `dataiku.api_client()`. `remote`: another instance, read through `com.arval.cdplib.client.get_remote_admin_client(instance_name)` (a library of the environment) |
+
+   One `local` row at most: a second one would read the same instance twice and is refused. No row: the instance the recipe runs on only, named `local`.
 2. Create a Python recipe with `instances` as input and the twelve outputs below. Paste [recipes/extract_dss.py](recipes/extract_dss.py). Partition the outputs by day like step 1.
 3. Run it in the same scenario as step 1, as a user with an admin API key ("Run as" in the scenario settings): connections, users, groups and instance variables need admin rights.
 4. Restrict the access to `dss_connections`: `jdbc_url` is the URL as configured and can hold a password.
 
-Every row of the twelve outputs starts with `dss_instance`. An instance that cannot be read (no admin client, unreachable) gives one `FAILED` row in `inventory_log`, with an empty `project_key`; the other instances are still read.
+Every row of the twelve outputs starts with `dss_instance`. An instance that cannot be read (no admin client, unreachable, `instance_location` neither `local` nor `remote`) gives one `FAILED` row in `inventory_log`, with an empty `project_key`; the other instances are still read.
 
 `PARALLEL` sets how many projects are read at the same time (4). `METRICS = "NONE"` skips the metrics, one call per dataset and folder, if runs get too slow.
 
@@ -276,4 +283,4 @@ Reliability: a table can look unrelated only because the dataset pointing to it 
 
 ## Compatibility
 
-Python 3.9 and later, DSS 13.2 and 15.2. Step 1 only uses `SQLExecutor2.query_to_df` and dataset reads and writes. Step 2 uses the public API (`dataikuapi`), checked against the 13.4.4 sources, and reaches each instance of `instances` through `com.arval.cdplib.client.get_remote_admin_client`. Step 3 only reads and writes datasets.
+Python 3.9 and later, DSS 13.2 and 15.2. Step 1 only uses `SQLExecutor2.query_to_df` and dataset reads and writes. Step 2 uses the public API (`dataikuapi`), checked against the 13.4.4 sources, and reaches each remote instance of `instances` through `com.arval.cdplib.client.get_remote_admin_client`. Step 3 only reads and writes datasets.

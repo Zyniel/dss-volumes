@@ -140,7 +140,7 @@ except ValueError as error:
 
 # --- extract_dss -----------------------------------------------------------------------------
 INPUTS.clear()
-INPUTS["instances"] = pd.DataFrame(columns=["instance_name"])
+INPUTS["instances"] = pd.DataFrame(columns=["instance_name", "instance_location"])
 printed = run_recipe("extract_dss.py", {"DKU_DST_snapshot_day": today})
 EXTRACT_OUTPUTS = ["dss_connection_permissions", "dss_connections", "dss_dataset_shares", "dss_datasets",
                    "dss_flow_links", "dss_group_members", "dss_groups", "dss_managed_folders", "dss_project_tags",
@@ -157,7 +157,8 @@ check("extract: every output written with its declared schema and the day", extr
 extracted = dict(WRITTEN)
 
 # Two instances listed: each read through the admin client library
-INPUTS["instances"] = pd.DataFrame({"instance_name": ["DESIGN", "AUTOMATION"]})
+INPUTS["instances"] = pd.DataFrame({"instance_name": ["DESIGN", "AUTOMATION"],
+                                    "instance_location": ["local", "remote"]})
 run_recipe("extract_dss.py", {"DKU_DST_snapshot_day": today})
 check("extract: every instance of the instances dataset read, named in dss_instance",
       sorted(set(WRITTEN["dss_projects"].dss_instance)) == ["AUTOMATION", "DESIGN"]

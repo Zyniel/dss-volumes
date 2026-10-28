@@ -68,18 +68,39 @@ RESULT_NAMES = ["dss_projects", "dss_project_tags", "dss_datasets", "dss_managed
 def connect_instances(instance_rows, get_admin_client, local_client):
     """[{"name", "client"} or {"name", "error"}], one per row of the instances dataset.
 
-    instance_rows     rows of instances (dicts), with at least instance_name. Rows without a
-                      name are skipped
-    get_admin_client  function instance_name -> admin client of that instance (in DSS:
+    instance_rows     rows of instances (dicts): instance_name, and instance_location
+                      local   the instance the recipe runs on: local_client
+                      remote  another instance: get_admin_client(instance_name)
+                      Rows without a name are skipped
+    get_admin_client  function instance_name -> admin client of a remote instance (in DSS:
                       com.arval.cdplib.client.get_remote_admin_client)
-    local_client      client of the instance the recipe runs on (dataiku.api_client()), used
-                      only when instances has no row: that instance is then named "local"
-    An instance whose client cannot be made gets its error; the others are still read.
+    local_client      client of the instance the recipe runs on (dataiku.api_client())
+    No row: the instance the recipe runs on only, named "local". An instance whose client
+    cannot be made gets its error (as does a location other than local or remote, or a
+    second local instance, which would be read twice); the others are still read.
     """
     instances = []
+    n_local = 0
     for row in instance_rows:
         name = cell_text(row.get("instance_name"))
         if name is None:
+            continue
+        location = cell_text(row.get("instance_location"))
+        if location is not None:
+            location = location.lower()
+
+        if location == "local":
+            n_local = n_local + 1
+            if n_local > 1:
+                instances.append({"name": name, "error": "a second local instance: the instance the recipe "
+                                                          "runs on can be read once only"})
+                continue
+            instances.append({"name": name, "client": local_client})
+            continue
+
+        if location != "remote":
+            instances.append({"name": name, "error": "instance_location must be local or remote, not %r"
+                                                     % row.get("instance_location")})
             continue
         try:
             client = get_admin_client(name)
