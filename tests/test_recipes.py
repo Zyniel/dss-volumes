@@ -8,6 +8,7 @@ import io
 import os
 import runpy
 import sys
+import types
 
 sys.dont_write_bytecode = True
 import pandas as pd
@@ -15,7 +16,7 @@ import pandas as pd
 from harness import REPO, check, finish, install_fake_dataiku
 sys.path.insert(0, REPO)
 from dbmon import schemas  # noqa: E402
-from fake_dss import CONNECTION_MAPPING, DATABASES, FakeClient
+from fake_dss import AUTOMATION_PROJECTS, CONNECTION_MAPPING, DATABASES, FakeClient
 
 WRITTEN = {}
 SCHEMAS_WRITTEN = {}
@@ -36,11 +37,24 @@ class FakeDataset(object):
         WRITTEN[self.name] = rows.copy()
 
 
+def remote_admin_client(instance_name):
+    if instance_name == "AUTOMATION":
+        return FakeClient(AUTOMATION_PROJECTS)
+    return FakeClient()
+
+
 def run_recipe(file_name, flow_variables):
     extra = {"Dataset": FakeDataset, "api_client": FakeClient}
     if flow_variables is not None:
         extra["dku_flow_variables"] = flow_variables
     install_fake_dataiku(extra)
+    # stand-in for com.arval.cdplib.client, the admin client library of the environment
+    for module_name in ("com", "com.arval", "com.arval.cdplib"):
+        sys.modules[module_name] = types.ModuleType(module_name)
+    cdplib_client = types.ModuleType("com.arval.cdplib.client")
+    cdplib_client.get_remote_admin_client = remote_admin_client
+    sys.modules["com.arval.cdplib.client"] = cdplib_client
+    sys.modules["com.arval.cdplib"].client = cdplib_client
     WRITTEN.clear()
     SCHEMAS_WRITTEN.clear()
     printed = io.StringIO()
@@ -126,12 +140,14 @@ except ValueError as error:
 
 # --- extract_dss -----------------------------------------------------------------------------
 INPUTS.clear()
+INPUTS["instances"] = pd.DataFrame(columns=["instance_name"])
 printed = run_recipe("extract_dss.py", {"DKU_DST_snapshot_day": today})
 EXTRACT_OUTPUTS = ["dss_connection_permissions", "dss_connections", "dss_dataset_shares", "dss_datasets",
                    "dss_flow_links", "dss_group_members", "dss_groups", "dss_managed_folders", "dss_project_tags",
                    "dss_projects", "dss_users", "inventory_log"]
-check("extract: no input read, the twelve outputs written", sorted(WRITTEN) == EXTRACT_OUTPUTS, sorted(WRITTEN))
-check("extract: summary with the failed project", "2 of 3 projects read" in printed and "FAILED BROKEN" in printed,
+check("extract: the twelve outputs written, the local instance only when instances is empty",
+      sorted(WRITTEN) == EXTRACT_OUTPUTS and set(WRITTEN["dss_projects"].dss_instance) == {"local"}, sorted(WRITTEN))
+check("extract: summary with the failed project", "2 of 3 projects read" in printed and "FAILED local BROKEN" in printed,
       printed)
 extract_declared = True
 for name in WRITTEN:
@@ -139,6 +155,13 @@ for name in WRITTEN:
         extract_declared = False
 check("extract: every output written with its declared schema and the day", extract_declared)
 extracted = dict(WRITTEN)
+
+# Two instances listed: each read through the admin client library
+INPUTS["instances"] = pd.DataFrame({"instance_name": ["DESIGN", "AUTOMATION"]})
+run_recipe("extract_dss.py", {"DKU_DST_snapshot_day": today})
+check("extract: every instance of the instances dataset read, named in dss_instance",
+      sorted(set(WRITTEN["dss_projects"].dss_instance)) == ["AUTOMATION", "DESIGN"]
+      and "orders_iot" in set(WRITTEN["dss_datasets"][WRITTEN["dss_datasets"].dss_instance == "AUTOMATION"].dataset_name))
 
 # --- refine_inventory ------------------------------------------------------------------------
 REFINE_OUTPUTS = ["database_usage", "dataset_locations", "dataset_roles", "dataset_storage", "dataset_tables",

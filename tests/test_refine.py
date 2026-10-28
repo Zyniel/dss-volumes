@@ -9,7 +9,7 @@ sys.dont_write_bytecode = True
 import pandas as pd
 
 from harness import check, finish, install_fake_dataiku
-from fake_dss import CONNECTION_MAPPING, DATABASES, FakeClient
+from fake_dss import AUTOMATION_PROJECTS, CONNECTION_MAPPING, DATABASES, FakeClient
 
 install_fake_dataiku()
 from dbmon import collect, dss_extract, refine, schemas  # noqa: E402
@@ -94,12 +94,12 @@ check("connection_name = the dataset's own connection, audit_connection_name = t
 
 audits = refine.audit_connections(DATABASES, CONNECTION_MAPPING)
 check("admin connections are their own audit connection",
-      audits["ADM_PG_APP"] == [("ADM_PG_APP", "PG app")] and audits["ADM_ORA"] == [("ADM_ORA", "ORA")])
-check("mapped to an admin connection databases does not list: nothing", "ORA_LOST" not in audits)
+      audits[(None, "ADM_PG_APP")] == [("ADM_PG_APP", "PG app")] and audits[(None, "ADM_ORA")] == [("ADM_ORA", "ORA")])
+check("mapped to an admin connection databases does not list: nothing", (None, "ORA_LOST") not in audits)
 two = refine.audit_connections(DATABASES, pd.DataFrame([("SHARED", "ADM_PG_APP"), ("SHARED", "ADM_ORA")],
                                                        columns=["dss_connection", "audit_connection"]))
 check("a connection mapped to two admin connections leads to both",
-      two["SHARED"] == [("ADM_PG_APP", "PG app"), ("ADM_ORA", "ORA")])
+      two[(None, "SHARED")] == [("ADM_PG_APP", "PG app"), ("ADM_ORA", "ORA")])
 without_mapping = refine.refine(step2, step1["tables"], step1["role_settings"], DATABASES, None)["dataset_locations"]
 check("without the mapping: datasets of non-admin connections are UNMAPPED",
       set(without_mapping[without_mapping.dataset_name == "raw_orders"].candidate_status) == {"UNMAPPED"})
@@ -178,10 +178,10 @@ check("DSS schema: named by a rule, or holding a table a dataset points to (Post
 check("owned only by idle managed datasets: PILOTED_IDLE",
       refine.dss_relation({"standalone": "NO", "status": "OWNED", "owner_nature": "MANAGED_IDLE",
                            "dss_schema": "YES"}) == "PILOTED_IDLE")
-waste = owned[owned.waste_candidate == "YES"].dss_relation
-check("waste candidates: idle, declared unused, unrelated in a DSS schema only",
-      set(waste) <= {"PILOTED_IDLE", "DECLARED_UNUSED", "UNRELATED_DSS_SCHEMA"}
-      and owned[owned.dss_relation == "UNRELATED"].waste_candidate.eq("NO").all() and len(waste) > 0)
+to_review = owned[owned.to_review == "YES"].dss_relation
+check("tables to review: idle, declared unused, unrelated in a DSS schema only",
+      set(to_review) <= {"PILOTED_IDLE", "DECLARED_UNUSED", "UNRELATED_DSS_SCHEMA"}
+      and owned[owned.dss_relation == "UNRELATED"].to_review.eq("NO").all() and len(to_review) > 0)
 
 # --- database_usage -----------------------------------------------------------------------------
 usage = results["database_usage"]
@@ -194,14 +194,14 @@ check("database_usage: every metric summed, same totals as step 1, every table c
 pg_unrelated = usage[(usage.label == "PG app") & (usage.schema_name == "appx")].set_index("dss_relation")
 check("database_usage: one row per schema and relation, with its tables",
       pg_unrelated.loc["DECLARED_UNUSED", "n_tables"] == 1
-      and pg_unrelated.loc["DECLARED_UNUSED", "waste_candidate"] == "YES"
+      and pg_unrelated.loc["DECLARED_UNUSED", "to_review"] == "YES"
       and pg_unrelated.loc["STANDALONE", "n_tables"] >= 1)
 check("database_usage: reliability, datasets of the database not located (missing, per_user) and failed projects",
       set(usage[usage.label == "PG app"].n_datasets_unlocated) == {2}
       and set(usage[usage.label == "ORA"].n_datasets_unlocated) == {0}
       and set(usage.n_projects_failed) == {1})
-by_database = usage.groupby(["label", "waste_candidate"]).total_mb.sum()
-check("database_usage: piloted and possible waste per database add up to the database",
+by_database = usage.groupby(["label", "to_review"]).total_mb.sum()
+check("database_usage: piloted and to review per database add up to the database",
       abs(by_database.loc["ORA"].sum() - step1["tables"][step1["tables"].label == "ORA"].total_mb.sum()) < 0.01)
 three_decimals = True
 for value in usage.total_mb:
@@ -280,8 +280,11 @@ check("datasets and folders by nature",
       consumption.loc["SALES", ["n_datasets", "n_managed_folders", "n_produced", "n_managed_idle", "n_external_source",
                                 "n_external_unused"]].tolist() == [11, 1, 4, 0, 1, 7]
       and consumption.loc["FIN", ["n_produced", "n_managed_idle", "n_external_source", "n_external_unused"]].tolist()
-      == [2, 1, 1, 1] and consumption.loc["FIN", "n_datasets_not_found"] == 1)
-check("no counted object without size here", consumption.n_size_unknown.sum() == 0)
+      == [2, 2, 1, 1] and consumption.loc["FIN", "n_datasets_not_found"] == 1)
+check("a counted object without size (never_built, metrics not readable): n_size_unknown",
+      consumption.loc["FIN", "n_size_unknown"] == 1 and consumption.loc["SALES", "n_size_unknown"] == 0
+      and storage.loc[("DATASET", "FIN", "never_built"), ["dataset_nature", "size_source", "counted"]].tolist()
+      == ["MANAGED_IDLE", "NONE", "YES"])
 
 three_decimals = True
 for column in consumption.columns:
@@ -305,7 +308,7 @@ check("schema_usage: one line per schema of every database, the empty ones inclu
       and lines.loc[("PG app", "public"), "n_tables"] == 0 and lines.loc[("ORA", "DBMON"), "n_tables"] == 0)
 empty = lines.loc[("PG app", "public")]
 check("schema without table: 0 MB, % empty",
-      empty.total_mb == 0 and pd.isna(empty.piloted_pct) and pd.isna(empty.waste_pct) and empty.dss_schema == "NO")
+      empty.total_mb == 0 and pd.isna(empty.piloted_pct) and pd.isna(empty.to_review_pct) and empty.dss_schema == "NO")
 totals_ok = True
 for metric in refine.TABLE_METRICS:
     if abs(schema_lines[metric].sum() - step1["tables"][metric].sum()) > 0.01:
@@ -320,8 +323,8 @@ check("schema_usage: MB and % of a relation, of the schema's space",
       and abs(dssout.declared_unused_pct - round(unused_mb * 100 / dssout.total_mb, 2)) < 0.001
       and dssout.declared_unused_n_tables == 1 and dssout.detected_use_case == "SALES",
       dssout[["total_mb", "declared_unused_total_mb", "declared_unused_pct"]].to_string())
-check("schema_usage: waste summary",
-      abs(dssout.waste_total_mb - dssout.total_mb) < 0.001 and dssout.waste_pct == 100)
+check("schema_usage: to review summary",
+      abs(dssout.to_review_total_mb - dssout.total_mb) < 0.001 and dssout.to_review_pct == 100)
 check("schema_usage: dss_related = every table a dataset points to, whatever its relation",
       lines.loc[("PG app", "sales_dsswork"), "dss_related_pct"] == 100
       and lines.loc[("PG app", "sales_dsswork"), "read_by_dss_pct"] == 100
@@ -340,7 +343,7 @@ check("schema_usage: the % of a schema add up to 100, the MB to its total",
 group_metrics_ok = True
 for group_name, relations in (("declared_unused", ["DECLARED_UNUSED"]),
                               ("dss_related", ["PILOTED", "PILOTED_IDLE", "READ_BY_DSS", "DECLARED_UNUSED"]),
-                              ("waste", ["PILOTED_IDLE", "DECLARED_UNUSED", "UNRELATED_DSS_SCHEMA"])):
+                              ("to_review", ["PILOTED_IDLE", "DECLARED_UNUSED", "UNRELATED_DSS_SCHEMA"])):
     group_tables = dssout_tables[dssout_tables.dss_relation.isin(relations)]
     if dssout[group_name + "_n_tables"] != len(group_tables):
         group_metrics_ok = False
@@ -348,7 +351,7 @@ for group_name, relations in (("declared_unused", ["DECLARED_UNUSED"]),
         if abs(dssout[group_name + "_" + metric] - group_tables[metric].sum()) > 0.001:
             group_metrics_ok = False
 check("schema_usage: every metric of the tables per relation and per cumulated group, with its table count",
-      group_metrics_ok and dssout.waste_n_tables == 4 and dssout.dss_related_n_tables == 1)
+      group_metrics_ok and dssout.to_review_n_tables == 6 and dssout.dss_related_n_tables == 1)
 for metric in refine.TABLE_METRICS:
     per_relation = []
     for relation in refine.DSS_RELATIONS:
@@ -364,5 +367,33 @@ check("schema_usage: reliability counts of the database",
 without_rules = refine.refine(step2, step1["tables"], step1["role_settings"], DATABASES, CONNECTION_MAPPING)
 check("without naming_rules: the schemas holding tables only",
       len(without_rules["schema_usage"]) == len(step1["tables"].drop_duplicates(["label", "schema_name"])))
+
+# --- several DSS instances ----------------------------------------------------------------------
+two_instances = dss_extract.extract_instances([{"name": "DESIGN", "client": FakeClient()},
+                                               {"name": "AUTOMATION", "client": FakeClient(AUTOMATION_PROJECTS)}])
+both = refine.refine(two_instances, step1["tables"], step1["role_settings"], DATABASES, CONNECTION_MAPPING,
+                     step1["naming_rules"])
+both_owned = both["table_ownership"].set_index(["label", "schema_name", "table_name"])
+iot = both_owned.loc[("ORA", "SALES_DSSOUT", "IOT_T")]
+check("two instances: the table only the Automation node writes is PILOTED, owned there",
+      (iot.dss_relation, iot.owner_instance, iot.owner_project, iot.owner_dataset, iot.to_review)
+      == ("PILOTED", "AUTOMATION", "SALES", "orders_iot", "NO"), iot.to_string())
+both_consumption = both["project_consumption"].set_index(["dss_instance", "project_key"])
+check("two instances: one consumption row per instance and project, SALES twice",
+      sorted(both_consumption.index) == [("AUTOMATION", "SALES"), ("DESIGN", "FIN"), ("DESIGN", "SALES")]
+      and abs(both_consumption.loc[("AUTOMATION", "SALES"), "database_mb"] - iot.total_mb) < 0.001
+      and abs(both_consumption.loc[("DESIGN", "SALES"), "database_mb"] - consumption.loc["SALES", "database_mb"]) < 0.001)
+check("two instances: every column declared",
+      all(len(schemas.conform(both[name], name)) == len(both[name]) for name in both))
+
+instance_mapping = CONNECTION_MAPPING.copy()
+instance_mapping["dss_instance"] = None
+instance_mapping.loc[len(instance_mapping)] = ["ORA_URL", "ADM_PG_APP", "AUTOMATION"]
+per_instance = refine.refine(two_instances, step1["tables"], step1["role_settings"], DATABASES, instance_mapping,
+                             step1["naming_rules"])["dataset_tables"].set_index(["dss_instance", "project_key",
+                                                                                 "dataset_name"])
+check("audit_connection_mapping with a dss_instance: applies to that instance only, wins over the general row",
+      per_instance.loc[("AUTOMATION", "SALES", "orders_iot"), "database_label"] == "PG app"
+      and per_instance.loc[("DESIGN", "SALES", "via_url"), "database_label"] == "ORA")
 
 finish()

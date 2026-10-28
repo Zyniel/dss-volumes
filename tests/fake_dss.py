@@ -7,8 +7,12 @@ SALES   use case SALES. raw_orders (source) -> compute_clean -> orders_clean, or
         dataset uses (UNUSED).
 FIN     reads SALES.orders_clean and lake_input (S3) -> join -> fin_summary -> copy ->
         dup_writer, which writes the same table as SALES.orders_clean (two owners). Schema
-        from a project variable. A managed folder written by no recipe (idle).
+        from a project variable. A managed folder written by no recipe (idle). never_built:
+        partitioned, never built, DSS fails to give its metrics.
 BROKEN  its flow graph cannot be read: the project fails.
+
+AUTOMATION_PROJECTS: an Automation node. Its own SALES project (same key as on the Design
+node) writes the Oracle table SALES_DSSOUT.IOT_T, which no dataset of the Design node uses.
 
 Every API call is counted in CALLS, so that the tests can check how many are made.
 """
@@ -118,7 +122,11 @@ PROJECTS = {
             dataset("missing", "PostgreSQL", "PG_SALES", "appx", "nope"),
             dataset("dup_writer", "PostgreSQL", "PG_SALES", "sales_dssout", "SALES_orders", managed=True),
             dataset("lake_input", "S3", "s3_lake", path="/lake/fin"),
+            # partitioned, never built: DSS cannot give its metrics
+            dataset("never_built", "Filesystem", "filesystem_managed", path="${projectKey}/never_built", managed=True,
+                    dimensions=["snapshot_day"]),
         ],
+        "metrics_failing": ["never_built"],
         "folders": [folder("idle1", "old drops", "S3", "s3_lake", "/drops")],
         "recipes": {"join": "join", "copy": "sync"},
         "metrics": {
@@ -138,6 +146,22 @@ PROJECTS = {
     },
     "BROKEN": {"tags": [], "variables": {"standard": {}, "local": {}}, "exposed": {"objects": []},
                "datasets": [], "folders": [], "recipes": {}, "metrics": {}, "graph": None},
+}
+
+AUTOMATION_PROJECTS = {
+    "SALES": {
+        "tags": ["CDP-UseCase:SALES"],
+        "variables": {"standard": {}, "local": {}},
+        "exposed": {"objects": []},
+        "datasets": [dataset("orders_iot", "Oracle", "ORA_URL", "", "IOT_T", managed=True)],
+        "folders": [],
+        "recipes": {"build_iot": "python"},
+        "metrics": {},
+        "graph": {
+            "build_iot": node("RUNNABLE_RECIPE", "build_iot", [], ["orders_iot"]),
+            "orders_iot": node("COMPUTABLE_DATASET", "orders_iot", ["build_iot"]),
+        },
+    },
 }
 
 # Connection details, as get_connection(name).get_info() returns them (resolved)
@@ -215,9 +239,9 @@ class Handle(object):
 
 
 class FakeProject(object):
-    def __init__(self, project_key):
+    def __init__(self, project_key, definition):
         self.project_key = project_key
-        self.definition = PROJECTS[project_key]
+        self.definition = definition
 
     def list_datasets(self):
         count("list_datasets")
@@ -265,6 +289,8 @@ class FakeProject(object):
 
     def metrics_of(self, object_name):
         count("get_last_metric_values")
+        if object_name in self.definition.get("metrics_failing", []):
+            raise Exception("Root path of the dataset %s does not exist" % object_name)
         raw = {"metrics": self.definition["metrics"].get(object_name, [])}
         return Handle(get_raw=lambda: raw)
 
@@ -276,16 +302,24 @@ class FakeProject(object):
 
 
 class FakeClient(object):
+    """One DSS instance. projects: its projects (default: the Design node, PROJECTS)."""
+
+    def __init__(self, projects=None):
+        self.projects = projects
+        if self.projects is None:
+            self.projects = PROJECTS
+
     def list_projects(self):
         count("list_projects")
         projects = []
-        for project_key in PROJECTS:
+        for project_key in self.projects:
             projects.append({"projectKey": project_key, "name": project_key.title() + " project",
-                             "ownerLogin": "alice", "tags": PROJECTS[project_key]["tags"]})
+                             "ownerLogin": "alice", "tags": self.projects[project_key]["tags"]})
         return projects
 
     def get_project(self, project_key):
-        return FakeProject(project_key)
+        return FakeProject(project_key, self.projects[project_key])
+
 
     def get_global_variables(self):
         count("get_global_variables")
@@ -314,3 +348,13 @@ class FakeClient(object):
     def list_groups(self):
         count("list_groups")
         return GROUPS
+
+
+class UnreachableClient(object):
+    """An instance that cannot be reached."""
+
+    def get_global_variables(self):
+        raise Exception("connection refused")
+
+    def list_projects(self):
+        raise Exception("connection refused")

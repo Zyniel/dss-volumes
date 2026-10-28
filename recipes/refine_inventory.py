@@ -17,7 +17,7 @@
 #         dataset_storage           one row per dataset or folder: storage kind, size, counted
 #         project_consumption       one row per project: the space it is responsible for
 #         database_usage            one row per database, schema and DSS relation: piloted
-#                                   space and possible waste
+#                                   space and to review
 #         schema_usage              one row per schema of every database, even empty: its
 #                                   space split by DSS relation, in MB and %
 #

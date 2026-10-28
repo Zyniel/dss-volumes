@@ -146,6 +146,14 @@ check("Oracle: the dropped table is left out", "OLD_STUFF" not in set(ora_object
 restored = ora_objects[ora_objects.parent_table == "T_RESTORE"]
 check("Oracle: the restored table keeps its BIN$-named index", restored.object_name.str.startswith("BIN$").sum() == 1)
 check("Oracle: uncompressed indexes are NONE", "DISABLED" not in set(ora_objects.compression.dropna()))
+no_segment = ora_objects[ora_objects.n_segments == 0].set_index("object_name")
+check("Oracle: tables without segment listed at 0 MB (never written, temporary, external)",
+      sorted(no_segment.index) == ["EMPTY_T", "EXT_T", "GTT"] and (no_segment.size_mb == 0).all()
+      and no_segment.loc["EMPTY_T", "tablespace_name"] == "SALES_DSSOUT_DATA"
+      and no_segment.loc["EMPTY_T", "parent_table"] == "EMPTY_T", no_segment.to_string())
+check("Oracle: no segment-less row for an index-organised table nor a dropped one",
+      len(ora_objects[ora_objects.parent_table == "IOT_T"]) == 2
+      and "OLD_STUFF" not in set(ora_objects.object_name))
 
 # --- tables ------------------------------------------------------------------------------------
 tables = results["tables"]
@@ -159,6 +167,8 @@ check("Oracle: ORDERS with its LOB and indexes, in DATA and INDEX tablespaces",
       ora_tables.loc["ORDERS", "lob_mb"] > 24 and ora_tables.loc["ORDERS", "n_indexes"] == 2
       and ora_tables.loc["ORDERS", "tablespaces"] == "SALES_DSSWORK_DATA,SALES_DSSWORK_INDEX")
 pg_tables = tables[tables.dss_connection == "ADM_PG_APP"].set_index(["schema_name", "table_name"])
+check("Oracle: an empty table is a table of 0 MB without segment",
+      ora_tables.loc["EMPTY_T", ["total_mb", "n_segments", "standalone"]].tolist() == [0, 0, "NO"])
 check("PostgreSQL: the sequence is a standalone row",
       pg_tables.loc[("appx", "seq1"), "standalone"] == "YES" and pg_tables.loc[("appx", "seq1"), "other_mb"] > 0)
 

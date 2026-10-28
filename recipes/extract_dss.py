@@ -1,9 +1,14 @@
 # DSS Python recipe: raw extraction of what DSS knows: projects, datasets, managed folders,
 # flow links, connections and their permissions, groups and users.
 #
-# Run it as a user with an admin API key (scenario "Run as" an admin). It has no input and
-# does not depend on the database extraction (collect_storage): both can run first.
+# Run it as a user with an admin API key (scenario "Run as" an admin). It does not depend on
+# the database extraction (collect_storage): both can run first.
 #
+# Input   instances                   one row per DSS instance to read (Design, Automation
+#                                     nodes... writing to the monitored databases), with at
+#                                     least instance_name: copied in dss_instance, and given to
+#                                     com.arval.cdplib.client.get_remote_admin_client.
+#                                     No row: this instance only, named "local".
 # Outputs dss_projects                one row per project
 #         dss_project_tags            one row per project and tag
 #         dss_datasets                one row per dataset: settings, storage, sharing, metrics
@@ -20,10 +25,11 @@
 # dss_connections.jdbc_url is the JDBC URL as configured: it can hold a password. Restrict
 # the access to that dataset accordingly.
 #
-# Every row starts with snapshot_day, the day of the run. Partition the outputs by day on
+# Every row starts with snapshot_day, the day of the run, and dss_instance. Partition the outputs by day on
 # that column, like the outputs of collect_storage.
 import datetime
 
+import com.arval.cdplib.client as cdpclient
 import dataiku
 
 from dbmon import dss_extract, progress, schemas
@@ -48,8 +54,9 @@ if hasattr(dataiku, "dku_flow_variables"):
 # Read
 # ---------------------------------------------------------------------------------------
 progress.log("extract_dss: building the partition %s" % day)
-client = dataiku.api_client()
-results = dss_extract.extract_dss(client, parallel=PARALLEL, metrics=METRICS)
+instance_rows = dataiku.Dataset("instances").get_dataframe().to_dict("records")
+instances = dss_extract.connect_instances(instance_rows, cdpclient.get_remote_admin_client, dataiku.api_client())
+results = dss_extract.extract_instances(instances, parallel=PARALLEL, metrics=METRICS)
 
 # ---------------------------------------------------------------------------------------
 # Write, every row starting with the day of the run. Every output gets its declared schema
@@ -66,4 +73,4 @@ log = results["inventory_log"]
 failed = log[log["status"] == "FAILED"]
 progress.log("%d of %d projects read" % (len(log) - len(failed), len(log)))
 for index, failure in failed.iterrows():
-    progress.log("FAILED %s: %s" % (failure["project_key"], failure["error"]))
+    progress.log("FAILED %s %s: %s" % (failure["dss_instance"], failure["project_key"], failure["error"]))

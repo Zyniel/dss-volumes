@@ -9,7 +9,7 @@ import pandas as pd
 
 from harness import check, finish, install_fake_dataiku
 import fake_dss
-from fake_dss import FakeClient
+from fake_dss import AUTOMATION_PROJECTS, FakeClient, UnreachableClient
 
 install_fake_dataiku()
 from dbmon import dss_extract, schemas  # noqa: E402
@@ -41,7 +41,7 @@ check("one call per project: datasets, recipes, folders, flow (settings only whe
       and calls.get("get_flow") == 3 and calls.get("get_settings") == 2, calls)
 check("recipe types from the recipe list: no recipe read", calls.get("get_recipe", 0) == 0, calls)
 check("project variables read only where a setting uses one (FIN)", calls.get("get_variables") == 1, calls)
-check("metrics: one call per dataset and folder (12 in SALES, 5 in FIN)", calls.get("get_last_metric_values") == 17,
+check("metrics: one call per dataset and folder (12 in SALES, 6 in FIN)", calls.get("get_last_metric_values") == 18,
       calls)
 check("connection details only for a variable or a missing user (PG_SALES, PG_PERUSER, ORA_URL)",
       calls.get("get_connection_info") == 3, calls)
@@ -104,6 +104,11 @@ check("metrics: partitions summed when there is no whole-dataset value",
 check("metrics: size only, in MB, YES",
       datasets.loc[("FIN", "fin_summary"), ["metric_size", "is_populated"]].tolist() == [2.0, "YES"])
 check("metrics: never computed, UNKNOWN", datasets.loc[("FIN", "missing"), "is_populated"] == "UNKNOWN")
+never_built = datasets.loc[("FIN", "never_built")]
+check("metrics not readable (dataset never built): project still OK, metrics empty, error kept and counted",
+      log.loc["FIN", "status"] == "OK" and never_built.is_populated == "UNKNOWN"
+      and "Root path" in never_built.metrics_error and log.loc["FIN", "metric_errors"] == 1
+      and log.loc["SALES", "metric_errors"] == 0)
 
 folders = results["dss_managed_folders"].set_index("folder_id")
 check("dss_managed_folders: settings, resolved path, size in MB and files",
@@ -190,6 +195,64 @@ for name in in_parallel:
     same = parallel_rows.fillna("-").astype(str).equals(sequential_rows.fillna("-").astype(str))
     check("parallel = 4 and parallel = 1 give the same %s, same order" % name, same)
 check("inventory_log: seconds per project", in_parallel["inventory_log"]["seconds"].notna().all())
+
+# --- several instances ---------------------------------------------------------------------------
+asked = []
+
+
+def get_admin_client(instance_name):
+    """Stand-in for com.arval.cdplib.client.get_remote_admin_client."""
+    asked.append(instance_name)
+    if instance_name == "DESIGN":
+        return FakeClient()
+    if instance_name == "AUTOMATION":
+        return FakeClient(AUTOMATION_PROJECTS)
+    if instance_name == "DOWN":
+        return UnreachableClient()
+    raise Exception("unknown instance %s" % instance_name)
+
+
+local = FakeClient()
+instance_rows = [
+    {"instance_name": "DESIGN"},
+    {"instance_name": " AUTOMATION "},
+    {"instance_name": float("nan")},
+    {"instance_name": "NO_SUCH"},
+    {"instance_name": "DOWN"},
+]
+instances = dss_extract.connect_instances(instance_rows, get_admin_client, local)
+by_name = {}
+for instance in instances:
+    by_name[instance["name"]] = instance
+check("instances: one client per instance_name through the admin client library, empty names skipped",
+      asked == ["DESIGN", "AUTOMATION", "NO_SUCH", "DOWN"] and "client" in by_name["AUTOMATION"]
+      and by_name["DESIGN"]["client"] is not local, asked)
+check("instances: a client that cannot be made is an error of that instance only",
+      "unknown instance" in by_name["NO_SUCH"]["error"] and "client" in by_name["DOWN"])
+check("instances: no row = the local instance, named local",
+      dss_extract.connect_instances([], get_admin_client, local) == [{"name": "local", "client": local}])
+
+several = dss_extract.extract_instances(instances, parallel=2)
+check("several instances: every output starts with dss_instance",
+      sorted(several) == OUTPUTS and all(several[name].columns[0] == "dss_instance" for name in several))
+instance_log = several["inventory_log"]
+failed_instances = instance_log[instance_log.project_key.isna()]
+check("several instances: an instance that cannot be read is one FAILED row, the others are read",
+      sorted(failed_instances.dss_instance) == ["DOWN", "NO_SUCH"] and set(failed_instances.status) == {"FAILED"}
+      and "connection refused" in failed_instances.set_index("dss_instance").loc["DOWN", "error"])
+sales = several["dss_projects"][several["dss_projects"].project_key == "SALES"]
+check("several instances: the same project key on two instances is two projects",
+      sorted(sales.dss_instance) == ["AUTOMATION", "DESIGN"]
+      and several["dss_datasets"][several["dss_datasets"].dss_instance == "AUTOMATION"].dataset_name.tolist()
+      == ["orders_iot"])
+declared_ok = True
+for name in several:
+    try:
+        schemas.conform(several[name], name)
+    except ValueError as error:
+        print(error)
+        declared_ok = False
+check("several instances: every column declared", declared_ok)
 
 # --- long values ---------------------------------------------------------------------------------
 many = pd.DataFrame({"project_key": ["P"] * 1000, "dataset_name": ["d"] * 1000,

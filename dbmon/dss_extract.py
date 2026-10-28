@@ -15,6 +15,10 @@ Results, one dataset each, close to what the API returns:
 - dss_users                   one row per user (no email)
 - inventory_log               one row per project: OK or FAILED
 
+Several instances: extract_instances reads each DSS instance of the instances dataset
+(Design, Automation nodes...) and puts its name in dss_instance, in front of every row. An instance that cannot
+be read gives one FAILED row in inventory_log (project_key empty); the others are still read.
+
 Calls are kept low: lists first (projects, connections, users, groups: one call per run;
 datasets, recipes, managed folders, flow graph, settings: one call per project). Per object:
 the metrics (one call per dataset or folder, see METRICS), connection details only for the
@@ -50,6 +54,83 @@ SHARE_COLUMNS = ["project_key", "dataset_name", "target_project"]
 TAG_COLUMNS = ["project_key", "tag", "tag_category", "tag_value"]
 PERMISSION_COLUMNS = ["connection", "permission", "scope", "group_name"]
 MEMBER_COLUMNS = ["group_name", "login"]
+
+
+# ---------------------------------------------------------------------------------------
+# Several instances
+# ---------------------------------------------------------------------------------------
+
+RESULT_NAMES = ["dss_projects", "dss_project_tags", "dss_datasets", "dss_managed_folders", "dss_dataset_shares",
+                "dss_flow_links", "dss_connections", "dss_connection_permissions", "dss_groups",
+                "dss_group_members", "dss_users", "inventory_log"]
+
+
+def connect_instances(instance_rows, get_admin_client, local_client):
+    """[{"name", "client"} or {"name", "error"}], one per row of the instances dataset.
+
+    instance_rows     rows of instances (dicts), with at least instance_name. Rows without a
+                      name are skipped
+    get_admin_client  function instance_name -> admin client of that instance (in DSS:
+                      com.arval.cdplib.client.get_remote_admin_client)
+    local_client      client of the instance the recipe runs on (dataiku.api_client()), used
+                      only when instances has no row: that instance is then named "local"
+    An instance whose client cannot be made gets its error; the others are still read.
+    """
+    instances = []
+    for row in instance_rows:
+        name = cell_text(row.get("instance_name"))
+        if name is None:
+            continue
+        try:
+            client = get_admin_client(name)
+        except Exception as error:
+            instances.append({"name": name, "error": str(error)[:500]})
+            continue
+        instances.append({"name": name, "client": client})
+
+    if not instances:
+        return [{"name": "local", "client": local_client}]
+    return instances
+
+
+def extract_instances(instances, parallel=4, metrics=None):
+    """Read every instance of connect_instances. Returns {result name: DataFrame}, every row
+    starting with dss_instance. An instance that fails gives one FAILED row in inventory_log."""
+    if metrics is None:
+        metrics = METRICS_ALL
+    frames = {}
+    for name in RESULT_NAMES:
+        frames[name] = []
+
+    for instance in instances:
+        name = instance["name"]
+        progress.log("instance %s: started" % name)
+        if "error" in instance:
+            results = {"inventory_log": instance_failure(instance["error"])}
+        else:
+            try:
+                results = extract_dss(instance["client"], parallel=parallel, metrics=metrics)
+            except Exception as error:
+                results = {"inventory_log": instance_failure(str(error)[:2000])}
+        if "dss_projects" not in results:
+            progress.log("instance %s: FAILED: %s" % (name, results["inventory_log"]["error"].iloc[0]))
+        for result_name in results:
+            rows = results[result_name]
+            rows.insert(0, "dss_instance", name)
+            frames[result_name].append(rows)
+
+    combined = {}
+    for name in RESULT_NAMES:
+        if frames[name]:
+            combined[name] = pd.concat(frames[name], ignore_index=True)
+        else:
+            combined[name] = pd.DataFrame()
+    return combined
+
+
+def instance_failure(error):
+    """inventory_log of an instance that could not be read: one FAILED row."""
+    return pd.DataFrame([{"project_key": None, "status": "FAILED", "error": error}])
 
 
 # ---------------------------------------------------------------------------------------
@@ -146,6 +227,11 @@ def read_one_project(client, project, instance_variables, metrics, counter=None)
         outcome["log_entry"]["datasets"] = len(outcome["dss_datasets"])
         outcome["log_entry"]["managed_folders"] = len(outcome["dss_managed_folders"])
         outcome["log_entry"]["links"] = len(outcome["dss_flow_links"])
+        metric_errors = 0
+        for row in outcome["dss_datasets"] + outcome["dss_managed_folders"]:
+            if row["metrics_error"] is not None:
+                metric_errors = metric_errors + 1
+        outcome["log_entry"]["metric_errors"] = metric_errors
     outcome["log_entry"]["seconds"] = seconds_since(started)
 
     done = ""
@@ -155,8 +241,11 @@ def read_one_project(client, project, instance_variables, metrics, counter=None)
     if entry["status"] == "FAILED":
         progress.log("project%s %s: FAILED in %s s: %s" % (done, project_key, entry["seconds"], entry["error"]))
     else:
-        progress.log("project%s %s: OK, %d datasets, %d folders, %d links in %s s"
-                     % (done, project_key, entry["datasets"], entry["managed_folders"], entry["links"], entry["seconds"]))
+        message = "project%s %s: OK, %d datasets, %d folders, %d links in %s s" % (
+            done, project_key, entry["datasets"], entry["managed_folders"], entry["links"], entry["seconds"])
+        if entry["metric_errors"] > 0:
+            message = message + ", metrics not readable for %d of them" % entry["metric_errors"]
+        progress.log(message)
     return outcome
 
 
@@ -211,25 +300,45 @@ def read_project(client, project, instance_variables, metrics, outcome):
         for target in targets:
             outcome["dss_dataset_shares"].append(
                 {"project_key": project_key, "dataset_name": dataset["dataset_name"], "target_project": target})
+        raw_metrics = {}
+        dataset["metrics_error"] = None
         if metrics == METRICS_ALL:
-            partition = ""
-            if dataset["partitioned"] == "YES":
-                partition = "ALL"
-            raw_metrics = project_handle.get_dataset(dataset["dataset_name"]).get_last_metric_values(partition).get_raw()
-            add_metrics(dataset, raw_metrics)
-        else:
-            add_metrics(dataset, {})
+            raw_metrics, dataset["metrics_error"] = read_dataset_metrics(project_handle, dataset)
+        add_metrics(dataset, raw_metrics)
         outcome["dss_datasets"].append(dataset)
 
     for raw in raw_folders:
         folder = folder_row(raw, project_key, variables)
+        raw_metrics = {}
+        folder["metrics_error"] = None
         if metrics == METRICS_ALL:
-            raw_metrics = project_handle.get_managed_folder(folder["folder_id"]).get_last_metric_values().get_raw()
-            add_metrics(folder, raw_metrics)
-        else:
-            add_metrics(folder, {})
+            raw_metrics, folder["metrics_error"] = read_folder_metrics(project_handle, folder)
+        add_metrics(folder, raw_metrics)
         del folder["metric_rows"]  # a folder holds files, not records
         outcome["dss_managed_folders"].append(folder)
+
+
+def read_dataset_metrics(project_handle, dataset):
+    """(last computed metrics, error) of a dataset: all partitions together when it is
+    partitioned. A dataset never built (no data folder yet) makes DSS fail: its metrics stay
+    empty and the error is kept, the project is still read."""
+    partition = ""
+    if dataset["partitioned"] == "YES":
+        partition = "ALL"
+    try:
+        raw_metrics = project_handle.get_dataset(dataset["dataset_name"]).get_last_metric_values(partition).get_raw()
+    except Exception as error:
+        return {}, str(error)[:500]
+    return raw_metrics, None
+
+
+def read_folder_metrics(project_handle, folder):
+    """(last computed metrics, error) of a managed folder, like read_dataset_metrics."""
+    try:
+        raw_metrics = project_handle.get_managed_folder(folder["folder_id"]).get_last_metric_values().get_raw()
+    except Exception as error:
+        return {}, str(error)[:500]
+    return raw_metrics, None
 
 
 def tag_row(project_key, tag):
@@ -749,6 +858,18 @@ def first_value(params, names):
         if value is not None and value != "":
             return value
     return None
+
+
+def cell_text(value):
+    """A cell of an editable dataset as stripped text. None when empty (None, NaN, blank)."""
+    if value is None:
+        return None
+    if not isinstance(value, str) and pd.isna(value):
+        return None
+    text = str(value).strip()
+    if text == "":
+        return None
+    return text
 
 
 def text_or_none(value):

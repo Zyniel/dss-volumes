@@ -43,6 +43,8 @@ COMMIT;
 CREATE MATERIALIZED VIEW sales_dssout.mv_totals AS
 SELECT MOD(id, 10) AS k, COUNT(*) AS n FROM sales_dssout.ledger GROUP BY MOD(id, 10);
 CREATE GLOBAL TEMPORARY TABLE sales_dssout.gtt (a NUMBER) ON COMMIT PRESERVE ROWS;
+-- table never written to: no segment yet (deferred segment creation)
+CREATE TABLE sales_dssout.empty_t (id NUMBER) SEGMENT CREATION DEFERRED;
 CREATE TABLE sales_dssout.trunc_me AS SELECT LEVEL AS id FROM dual CONNECT BY LEVEL <= 5000;
 -- dropped table: stays in the recycle bin
 CREATE TABLE sales_dsswork.old_stuff AS SELECT LEVEL AS id, RPAD('o', 1000, 'o') AS pad FROM dual CONNECT BY LEVEL <= 3000;

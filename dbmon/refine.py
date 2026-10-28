@@ -17,7 +17,7 @@ Results
                        and whether that size goes to its project
 - project_consumption  one row per project: the space it is responsible for
 - database_usage       one row per database, schema and DSS relation: piloted space and
-                       possible waste, for the administrators
+                       to review, for the administrators
 - schema_usage         one row per schema of every database, even empty: its space and how
                        it splits by DSS relation, in MB and in % of the schema
 
@@ -35,16 +35,21 @@ storage_kind: where the data is
 
 dss_relation: what DSS has to do with a step 1 table (table_ownership, database_usage)
   PILOTED               owned by a PRODUCED dataset
-  PILOTED_IDLE          owned by MANAGED_IDLE datasets only                  possible waste
+  PILOTED_IDLE          owned by MANAGED_IDLE datasets only                  to review
   READ_BY_DSS           only EXTERNAL_SOURCE datasets point to it
-  DECLARED_UNUSED       only EXTERNAL_UNUSED datasets point to it            possible waste
-  UNRELATED_DSS_SCHEMA  no dataset points to it, in a DSS schema             possible waste
+  DECLARED_UNUSED       only EXTERNAL_UNUSED datasets point to it            to review
+  UNRELATED_DSS_SCHEMA  no dataset points to it, in a DSS schema             to review
   UNRELATED             no dataset points to it, in another schema
   STANDALONE            an object of no table (sequence, temporary segment)
 A DSS schema: one whose name follows a naming rule (detected_use_case), or holding a table
 a dataset points to.
 
 Space always comes with every metric of the step 1 tables (TABLE_METRICS).
+
+Several DSS instances (Design and Automation nodes...) can write to the same databases. The
+DSS extraction then carries dss_instance on every row, and every dataset, project and
+connection is told apart by it: the same project key on two instances is two projects.
+Without dss_instance (a single instance), it is empty everywhere.
 
 Candidate schemas of a SQL dataset, in the order the database would use them
 (schema_source):
@@ -84,27 +89,28 @@ VARIABLE = re.compile(r"\$\{([^}]+)\}")
 TABLE_METRICS = ["total_mb", "table_mb", "index_mb", "lob_mb", "other_mb", "n_indexes", "n_segments"]
 TABLE_IDENTITY = ["label", "engine", "sql_variant", "server_name", "database_name", "schema_name", "table_name",
                   "standalone"]
-WASTE_RELATIONS = ("PILOTED_IDLE", "DECLARED_UNUSED", "UNRELATED_DSS_SCHEMA")
+REVIEW_RELATIONS = ("PILOTED_IDLE", "DECLARED_UNUSED", "UNRELATED_DSS_SCHEMA")
 # Datasets of a database whose table could not be found: an unrelated table may be theirs
 UNLOCATED_STATUSES = ("NOT_FOUND", "AMBIGUOUS", "PER_USER", "UNRESOLVED")
 
-ROLE_COLUMNS = ["project_key", "object_type", "object_name", "managed", "n_producers", "n_consumers",
+ROLE_COLUMNS = ["dss_instance", "project_key", "object_type", "object_name", "managed", "n_producers", "n_consumers",
                 "n_consuming_projects", "dataset_nature"]
-LOCATION_COLUMNS = ["project_key", "dataset_name", "candidate_rank", "candidate_status",
+LOCATION_COLUMNS = ["dss_instance", "project_key", "dataset_name", "candidate_rank", "candidate_status",
                     "connection_name", "audit_connection_name", "database_label",
                     "schema_name", "table_name", "schema_source", "note"]
-MATCH_COLUMNS = ["project_key", "dataset_name", "match_status", "connection_name", "audit_connection_name",
+MATCH_COLUMNS = ["dss_instance", "project_key", "dataset_name", "match_status", "connection_name", "audit_connection_name",
                  "database_label", "schema_name", "table_name", "candidate_rank", "schema_source", "note"]
 OWNERSHIP_COLUMNS = (TABLE_IDENTITY + TABLE_METRICS
-                     + ["detected_use_case", "detected_layer", "status", "owner_project", "owner_dataset",
+                     + ["detected_use_case", "detected_layer", "status", "owner_instance", "owner_project",
+                        "owner_dataset",
                         "owner_nature", "multiple_owners", "n_owning_datasets", "n_source_datasets",
                         "n_unused_datasets", "n_referencing_projects", "dss_schema", "dss_relation",
-                        "waste_candidate"])
-STORAGE_COLUMNS = ["project_key", "object_type", "object_name", "display_name", "storage_type", "connection",
+                        "to_review"])
+STORAGE_COLUMNS = ["dss_instance", "project_key", "object_type", "object_name", "display_name", "storage_type", "connection",
                    "dataset_nature", "storage_kind", "size_mb", "table_mb", "index_mb", "lob_mb", "other_mb",
                    "n_indexes", "n_segments", "size_source", "counted", "note"]
 USAGE_KEY = ["label", "engine", "sql_variant", "server_name", "database_name", "schema_name", "dss_schema",
-             "detected_use_case", "detected_layer", "dss_relation", "waste_candidate"]
+             "detected_use_case", "detected_layer", "dss_relation", "to_review"]
 USAGE_COLUMNS = USAGE_KEY + ["n_tables"] + TABLE_METRICS + ["n_datasets_unlocated", "n_projects_failed"]
 
 # Every dss_relation, in the order of the schema_usage columns
@@ -117,17 +123,17 @@ SCHEMA_IDENTITY = ["label", "engine", "sql_variant", "server_name", "database_na
 # Groups of tables in schema_usage, each one a prefix of its columns: one per dss_relation,
 # then two cumulated ones
 SCHEMA_GROUPS = ["piloted", "piloted_idle", "read_by_dss", "declared_unused", "unrelated_dss_schema", "unrelated",
-                 "standalone", "dss_related", "waste"]
+                 "standalone", "dss_related", "to_review"]
 
 
 def schema_groups_of(relation):
     """Prefixes of the schema_usage groups a table of this dss_relation counts in: its
-    relation, dss_related when a dataset points to it, waste when it is a waste candidate."""
+    relation, dss_related when a dataset points to it, to_review when it is a table to review."""
     groups = [relation.lower()]
     if relation in RELATED_RELATIONS:
         groups.append("dss_related")
-    if relation in WASTE_RELATIONS:
-        groups.append("waste")
+    if relation in REVIEW_RELATIONS:
+        groups.append("to_review")
     return groups
 
 
@@ -172,9 +178,10 @@ def refine(dss, tables, role_settings, databases, connection_mapping, naming_rul
     progress.log("Refinement: %d projects, %d datasets, %d folders, %d flow links, %d step 1 tables"
                  % (len(projects), len(datasets), len(folders), len(links), len(table_rows)))
 
+    # connections by instance and name: two instances can have connections of the same name
     connection_by_name = {}
     for connection in records(dss["dss_connections"]):
-        connection_by_name[connection["connection"]] = connection
+        connection_by_name[(instance_of(connection), connection["connection"])] = connection
 
     block_started = time.time()
     roles = dataset_roles(datasets, folders, links)
@@ -210,11 +217,11 @@ def refine(dss, tables, role_settings, databases, connection_mapping, naming_rul
 
     block_started = time.time()
     usage = database_usage(ownership, matches, project_log)
-    n_waste = 0
+    n_to_review = 0
     for group in usage:
-        if group["waste_candidate"] == "YES":
-            n_waste = n_waste + group["n_tables"]
-    log_block("database_usage", usage, block_started, "%d tables possible waste" % n_waste)
+        if group["to_review"] == "YES":
+            n_to_review = n_to_review + group["n_tables"]
+    log_block("database_usage", usage, block_started, "%d tables to review" % n_to_review)
 
     block_started = time.time()
     schemas = schema_usage(ownership, records(naming_rules), matches, project_log)
@@ -255,7 +262,7 @@ def dataset_roles(datasets, folders, links):
     consumers = {}
     consuming_projects = {}
     for link in links:
-        key = (link["object_type"], link["object_project"], link["object_name"])
+        key = (instance_of(link), link["object_type"], link["object_project"], link["object_name"])
         if link["direction"] == "output":
             producers[key] = producers.get(key, 0) + 1
             continue
@@ -267,17 +274,19 @@ def dataset_roles(datasets, folders, links):
 
     objects = []
     for dataset in datasets:
-        objects.append(("DATASET", dataset["project_key"], dataset["dataset_name"], dataset.get("managed") == "YES"))
+        objects.append((instance_of(dataset), "DATASET", dataset["project_key"], dataset["dataset_name"],
+                        dataset.get("managed") == "YES"))
     for folder in folders:
         # a managed folder is always managed by DSS
-        objects.append(("FOLDER", folder["project_key"], folder["folder_id"], True))
+        objects.append((instance_of(folder), "FOLDER", folder["project_key"], folder["folder_id"], True))
 
     rows = []
-    for object_type, project_key, object_name, managed in objects:
-        key = (object_type, project_key, object_name)
+    for instance, object_type, project_key, object_name, managed in objects:
+        key = (instance, object_type, project_key, object_name)
         n_producers = producers.get(key, 0)
         n_consumers = consumers.get(key, 0)
         rows.append({
+            "dss_instance": instance,
             "project_key": project_key,
             "object_type": object_type,
             "object_name": object_name,
@@ -313,7 +322,8 @@ def dataset_locations(datasets, connection_by_name, databases, connection_mappin
                            a dataset is its own audit connection. Empty when unmapped
     database_label         the label of that admin connection in databases
     A connection mapped to several admin connections gives its candidates once per admin
-    connection.
+    connection. A row of audit_connection_mapping with a dss_instance applies to that
+    instance only, and wins over a row without one.
 
     candidate_status
       CANDIDATE   a candidate schema and table, to look up in the step 1 tables
@@ -327,8 +337,11 @@ def dataset_locations(datasets, connection_by_name, databases, connection_mappin
 
     rows = []
     for dataset in datasets:
-        connection = connection_by_name.get(dataset.get("connection"), {})
-        audits = audits_by_connection.get(dataset.get("connection"), [])
+        instance = instance_of(dataset)
+        connection = connection_by_name.get((instance, dataset.get("connection")), {})
+        audits = audits_by_connection.get((instance, dataset.get("connection")))
+        if audits is None:
+            audits = audits_by_connection.get((None, dataset.get("connection")), [])
         if not audits:
             rows.extend(locations_of(dataset, connection, None, None, role_settings))
             continue
@@ -340,6 +353,7 @@ def dataset_locations(datasets, connection_by_name, databases, connection_mappin
 def locations_of(dataset, connection, audit_connection, label, role_settings):
     """Candidate rows of one dataset, for one of its audit connections."""
     base = {
+        "dss_instance": instance_of(dataset),
         "project_key": dataset["project_key"],
         "dataset_name": dataset["dataset_name"],
         "candidate_rank": None,
@@ -470,11 +484,12 @@ def split_schemas(search_path, login_user):
 
 
 def audit_connections(databases, connection_mapping):
-    """{DSS connection: [(audit connection, database label)]}.
+    """{(DSS instance, DSS connection): [(audit connection, database label)]}.
 
     An admin connection of databases is its own audit connection, with the label of its row
-    (the connection name when the label is empty). A connection of audit_connection_mapping
-    leads to the admin connections it is mapped to.
+    (the connection name when the label is empty), on every instance (DSS instance None). A
+    connection of audit_connection_mapping leads to the admin connections it is mapped to: on
+    the instance of its optional dss_instance column, or on every instance when it is empty.
     """
     label_of_admin = {}
     for row in records(databases):
@@ -485,7 +500,7 @@ def audit_connections(databases, connection_mapping):
 
     audits = {}
     for admin_connection in label_of_admin:
-        audits[admin_connection] = [(admin_connection, label_of_admin[admin_connection])]
+        audits[(None, admin_connection)] = [(admin_connection, label_of_admin[admin_connection])]
 
     if connection_mapping is None or connection_mapping.empty:
         return audits
@@ -499,10 +514,16 @@ def audit_connections(databases, connection_mapping):
         if label is None:
             continue  # mapped to a connection that databases does not list
         connection = str(connection).strip()
-        if connection not in audits:
-            audits[connection] = []
-        if (admin_connection, label) not in audits[connection]:
-            audits[connection].append((admin_connection, label))
+        instance = row.get("dss_instance")
+        if instance is not None and str(instance).strip() == "":
+            instance = None
+        if instance is not None:
+            instance = str(instance).strip()
+        key = (instance, connection)
+        if key not in audits:
+            audits[key] = []
+        if (admin_connection, label) not in audits[key]:
+            audits[key].append((admin_connection, label))
     return audits
 
 
@@ -537,7 +558,7 @@ def dataset_tables(locations, table_rows):
     candidates_by_dataset = {}
     dataset_order = []
     for location in locations:
-        key = (location["project_key"], location["dataset_name"])
+        key = (location.get("dss_instance"), location["project_key"], location["dataset_name"])
         if key not in candidates_by_dataset:
             candidates_by_dataset[key] = []
             dataset_order.append(key)
@@ -568,6 +589,7 @@ def dataset_tables(locations, table_rows):
             status = candidate["candidate_status"]
 
         row = {
+            "dss_instance": candidate.get("dss_instance"),
             "project_key": candidate["project_key"],
             "dataset_name": candidate["dataset_name"],
             "match_status": status,
@@ -617,20 +639,21 @@ def table_ownership(table_rows, matches, roles):
                    READ_ONLY     only EXTERNAL_SOURCE datasets point to it (read, not written)
                    UNUSED        only EXTERNAL_UNUSED datasets point to it
                    UNREFERENCED  no dataset points to it
-    owner_project, owner_dataset, owner_nature
+    owner_instance, owner_project, owner_dataset, owner_nature
                    the owning dataset: PRODUCED before MANAGED_IDLE, then the smallest
-                   project key, then dataset name. multiple_owners = YES when several
+                   instance, project key, dataset name. multiple_owners = YES when several
     n_owning_datasets, n_source_datasets, n_unused_datasets   datasets pointing to it, by nature
-    n_referencing_projects   projects of all those datasets
+    n_referencing_projects   projects of all those datasets (one per instance and project key)
     detected_use_case, detected_layer   as the naming rules of the database detect them
                    (step 1, naming_rules.sql)
-    dss_schema, dss_relation, waste_candidate   see the module documentation
+    dss_schema, dss_relation, to_review   see the module documentation
     The identity and every metric of the step 1 table are copied.
     """
     nature_by_dataset = {}
     for role in roles:
         if role["object_type"] == "DATASET":
-            nature_by_dataset[(role["project_key"], role["object_name"])] = role["dataset_nature"]
+            nature_by_dataset[(role.get("dss_instance"), role["project_key"], role["object_name"])] = \
+                role["dataset_nature"]
 
     pointing_by_table = {}
     for match in matches:
@@ -639,8 +662,10 @@ def table_ownership(table_rows, matches, roles):
         table_key = (match["database_label"], match["schema_name"], match["table_name"])
         if table_key not in pointing_by_table:
             pointing_by_table[table_key] = []
-        nature = nature_by_dataset.get((match["project_key"], match["dataset_name"]))
-        pointing_by_table[table_key].append((match["project_key"], match["dataset_name"], nature))
+        dataset_key = (match.get("dss_instance"), match["project_key"], match["dataset_name"])
+        nature = nature_by_dataset.get(dataset_key)
+        pointing_by_table[table_key].append((match.get("dss_instance"), match["project_key"], match["dataset_name"],
+                                             nature))
 
     rows = []
     for table in table_rows:
@@ -651,10 +676,10 @@ def table_ownership(table_rows, matches, roles):
         n_source = 0
         n_unused = 0
         projects = set()
-        for project_key, dataset_name, nature in pointing:
-            projects.add(project_key)
+        for instance, project_key, dataset_name, nature in pointing:
+            projects.add((instance, project_key))
             if nature in COUNTED_NATURES:
-                owners.append(owner_sort_key(project_key, dataset_name, nature))
+                owners.append(owner_sort_key(instance, project_key, dataset_name, nature))
             elif nature == "EXTERNAL_SOURCE":
                 n_source = n_source + 1
             else:
@@ -674,14 +699,16 @@ def table_ownership(table_rows, matches, roles):
         else:
             row["status"] = "UNREFERENCED"
 
+        row["owner_instance"] = None
         row["owner_project"] = None
         row["owner_dataset"] = None
         row["owner_nature"] = None
         if owners:
             first_owner = owners[0]
-            row["owner_project"] = first_owner[1]
-            row["owner_dataset"] = first_owner[2]
-            row["owner_nature"] = first_owner[3]
+            row["owner_instance"] = first_owner[5]
+            row["owner_project"] = first_owner[2]
+            row["owner_dataset"] = first_owner[3]
+            row["owner_nature"] = first_owner[4]
         row["multiple_owners"] = yes_no(len(owners) > 1)
         row["n_owning_datasets"] = len(owners)
         row["n_source_datasets"] = n_source
@@ -698,7 +725,7 @@ def table_ownership(table_rows, matches, roles):
     for row in rows:
         row["dss_schema"] = yes_no((row["label"], row["schema_name"]) in dss_schemas)
         row["dss_relation"] = dss_relation(row)
-        row["waste_candidate"] = yes_no(row["dss_relation"] in WASTE_RELATIONS)
+        row["to_review"] = yes_no(row["dss_relation"] in REVIEW_RELATIONS)
     return rows
 
 
@@ -719,12 +746,16 @@ def dss_relation(row):
     return "UNRELATED"
 
 
-def owner_sort_key(project_key, dataset_name, nature):
-    """Sort key of a possible owner: PRODUCED first, then project key, then dataset name."""
+def owner_sort_key(instance, project_key, dataset_name, nature):
+    """Sort key of a possible owner: PRODUCED first, then instance, project key, dataset
+    name. The instance itself comes last (it can be None, which does not sort)."""
     priority = 1
     if nature == "PRODUCED":
         priority = 0
-    return (priority, project_key, dataset_name, nature)
+    instance_text = ""
+    if instance is not None:
+        instance_text = instance
+    return (priority, instance_text, project_key, dataset_name, nature, instance)
 
 
 # ---------------------------------------------------------------------------------------
@@ -743,11 +774,12 @@ def dataset_storage(datasets, folders, roles, matches, ownership, connection_by_
     """
     nature_by_object = {}
     for role in roles:
-        nature_by_object[(role["object_type"], role["project_key"], role["object_name"])] = role["dataset_nature"]
+        key = (role.get("dss_instance"), role["object_type"], role["project_key"], role["object_name"])
+        nature_by_object[key] = role["dataset_nature"]
 
     match_by_dataset = {}
     for match in matches:
-        match_by_dataset[(match["project_key"], match["dataset_name"])] = match
+        match_by_dataset[(match.get("dss_instance"), match["project_key"], match["dataset_name"])] = match
 
     table_by_key = {}
     for table in ownership:
@@ -755,17 +787,19 @@ def dataset_storage(datasets, folders, roles, matches, ownership, connection_by_
 
     rows = []
     for dataset in datasets:
+        instance = instance_of(dataset)
         project_key = dataset["project_key"]
         name = dataset["dataset_name"]
-        connection_type = connection_by_name.get(dataset.get("connection"), {}).get("connection_type")
+        connection_type = connection_by_name.get((instance, dataset.get("connection")), {}).get("connection_type")
         row = {
+            "dss_instance": instance,
             "project_key": project_key,
             "object_type": "DATASET",
             "object_name": name,
             "display_name": name,
             "storage_type": dataset.get("dataset_type"),
             "connection": dataset.get("connection"),
-            "dataset_nature": nature_by_object.get(("DATASET", project_key, name)),
+            "dataset_nature": nature_by_object.get((instance, "DATASET", project_key, name)),
             "storage_kind": dataset_storage_kind(dataset, connection_type),
             "size_mb": None,
             "table_mb": None, "index_mb": None, "lob_mb": None, "other_mb": None,
@@ -775,22 +809,24 @@ def dataset_storage(datasets, folders, roles, matches, ownership, connection_by_
             "note": None,
         }
         if row["storage_kind"] == "DATABASE":
-            database_size(row, match_by_dataset.get((project_key, name)), table_by_key)
+            database_size(row, match_by_dataset.get((instance, project_key, name)), table_by_key)
         elif row["storage_kind"] != "NO_STORAGE":
             metric_size(row, dataset.get("metric_size"))
         rows.append(row)
 
     for folder in folders:
+        instance = instance_of(folder)
         project_key = folder["project_key"]
-        connection_type = connection_by_name.get(folder.get("connection"), {}).get("connection_type")
+        connection_type = connection_by_name.get((instance, folder.get("connection")), {}).get("connection_type")
         row = {
+            "dss_instance": instance,
             "project_key": project_key,
             "object_type": "FOLDER",
             "object_name": folder["folder_id"],
             "display_name": folder.get("folder_name"),
             "storage_type": folder.get("folder_type"),
             "connection": folder.get("connection"),
-            "dataset_nature": nature_by_object.get(("FOLDER", project_key, folder["folder_id"])),
+            "dataset_nature": nature_by_object.get((instance, "FOLDER", project_key, folder["folder_id"])),
             "storage_kind": files_storage_kind(folder.get("folder_type"), connection_type),
             "size_mb": None,
             "size_source": "NONE",
@@ -832,11 +868,14 @@ def database_size(row, match, table_by_key):
         if metric != "total_mb":
             row[metric] = table.get(metric)
     row["size_source"] = "TABLE"
-    owner = (table.get("owner_project"), table.get("owner_dataset"))
-    if owner == (row["project_key"], row["object_name"]):
+    owner = (table.get("owner_instance"), table.get("owner_project"), table.get("owner_dataset"))
+    if owner == (row.get("dss_instance"), row["project_key"], row["object_name"]):
         row["counted"] = "YES"
     elif table.get("owner_project") is not None:
-        row["note"] = "space counted on %s.%s" % owner
+        owner_name = "%s.%s" % (table.get("owner_project"), table.get("owner_dataset"))
+        if table.get("owner_instance") is not None:
+            owner_name = table.get("owner_instance") + ":" + owner_name
+        row["note"] = "space counted on %s" % owner_name
 
 
 def metric_size(row, size):
@@ -855,7 +894,7 @@ def metric_size(row, size):
 # ---------------------------------------------------------------------------------------
 
 def project_consumption(projects, tags, roles, matches, ownership, storage):
-    """Rows of project_consumption: one per project read.
+    """Rows of project_consumption: one per project read (per instance and project key).
 
     use_case, use_case_source   from the project tags (TAG, RULE or NONE)
     n_*                         its datasets and folders, by nature; datasets found or not
@@ -873,15 +912,19 @@ def project_consumption(projects, tags, roles, matches, ownership, storage):
     """
     tags_by_project = {}
     for tag in tags:
-        if tag["project_key"] not in tags_by_project:
-            tags_by_project[tag["project_key"]] = []
-        tags_by_project[tag["project_key"]].append(tag["tag"])
+        key = (instance_of(tag), tag["project_key"])
+        if key not in tags_by_project:
+            tags_by_project[key] = []
+        tags_by_project[key].append(tag["tag"])
 
     rows = []
     for project in projects:
+        instance = instance_of(project)
         project_key = project["project_key"]
-        project_use_case, source = use_case.project_use_case_and_source(project_key, tags_by_project.get(project_key, []))
+        project_tags = tags_by_project.get((instance, project_key), [])
+        project_use_case, source = use_case.project_use_case_and_source(project_key, project_tags)
         row = {
+            "dss_instance": instance,
             "project_key": project_key,
             "project_name": project.get("project_name"),
             "use_case": project_use_case,
@@ -914,10 +957,10 @@ def project_consumption(projects, tags, roles, matches, ownership, storage):
         rows.append(row)
     row_by_project = {}
     for row in rows:
-        row_by_project[row["project_key"]] = row
+        row_by_project[(row.get("dss_instance"), row["project_key"])] = row
 
     for role in roles:
-        row = row_by_project.get(role["project_key"])
+        row = row_by_project.get((role.get("dss_instance"), role["project_key"]))
         if row is None:
             continue
         if role["object_type"] == "DATASET":
@@ -928,7 +971,7 @@ def project_consumption(projects, tags, roles, matches, ownership, storage):
         row[counter] = row[counter] + 1
 
     for match in matches:
-        row = row_by_project.get(match["project_key"])
+        row = row_by_project.get((match.get("dss_instance"), match["project_key"]))
         if row is None:
             continue
         if match["match_status"] == "FOUND":
@@ -939,7 +982,7 @@ def project_consumption(projects, tags, roles, matches, ownership, storage):
     table_by_key = {}
     for table in ownership:
         table_by_key[(table["label"], table["schema_name"], table["table_name"])] = table
-        row = row_by_project.get(table["owner_project"])
+        row = row_by_project.get((table["owner_instance"], table["owner_project"]))
         if row is None:
             continue
         row["n_owned_tables"] = row["n_owned_tables"] + 1
@@ -952,7 +995,7 @@ def project_consumption(projects, tags, roles, matches, ownership, storage):
         row["database_n_segments"] = row["database_n_segments"] + int(number(table.get("n_segments")))
 
     for item in storage:
-        row = row_by_project.get(item["project_key"])
+        row = row_by_project.get((item.get("dss_instance"), item["project_key"]))
         if row is None:
             continue
         size = number(item.get("size_mb"))
@@ -974,19 +1017,19 @@ def project_consumption(projects, tags, roles, matches, ownership, storage):
     for match in matches:
         if match["match_status"] != "FOUND":
             continue
-        project_key = match["project_key"]
+        project = (match.get("dss_instance"), match["project_key"])
         table_key = (match["database_label"], match["schema_name"], match["table_name"])
-        if (project_key, table_key) in seen:
+        if (project, table_key) in seen:
             continue
-        seen.add((project_key, table_key))
-        row = row_by_project.get(project_key)
+        seen.add((project, table_key))
+        row = row_by_project.get(project)
         table = table_by_key.get(table_key)
         if row is None or table is None:
             continue
         size = number(table.get("total_mb"))
         if table["status"] == "UNUSED":
             row["database_unused_mb"] = row["database_unused_mb"] + size
-        elif table.get("owner_project") != project_key:
+        elif (table.get("owner_instance"), table.get("owner_project")) != project:
             row["database_read_mb"] = row["database_read_mb"] + size
 
     # Sums of decimal numbers carry tiny binary errors (1.1880000000000002): keep 3 decimals,
@@ -1000,7 +1043,7 @@ def project_consumption(projects, tags, roles, matches, ownership, storage):
 
 
 # ---------------------------------------------------------------------------------------
-# database_usage: piloted space and possible waste, per database and schema
+# database_usage: piloted space and tables to review, per database and schema
 # ---------------------------------------------------------------------------------------
 
 def database_usage(ownership, matches, project_log):
@@ -1088,7 +1131,7 @@ def schema_usage(ownership, naming_rule_rows, matches, project_log):
     Groups: one per dss_relation (piloted ... standalone), whose % add up to 100, then
       dss_related   the tables a DSS dataset points to, whatever its role: PILOTED,
                     PILOTED_IDLE, READ_BY_DSS, DECLARED_UNUSED
-      waste         the waste candidates: PILOTED_IDLE, DECLARED_UNUSED, UNRELATED_DSS_SCHEMA
+      to_review     the tables to review: PILOTED_IDLE, DECLARED_UNUSED, UNRELATED_DSS_SCHEMA
     n_datasets_unlocated, n_projects_failed   reliability, as in database_usage
     The space of a schema is the space of its tables: an index owned by another schema
     counts with its table, as in the step 1 tables.
@@ -1184,6 +1227,11 @@ def percent_of(part, whole):
 # ---------------------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------------------
+
+def instance_of(row):
+    """DSS instance of a row of the DSS extraction. None when the extraction has none."""
+    return row.get("dss_instance")
+
 
 def records(rows):
     """Rows of a DataFrame as a list of dicts, the missing values (NaN) as None."""
